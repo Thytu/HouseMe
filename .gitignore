@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# HouseMe state (contains personal info)
+.houseme_state.json
+.houseme_images.json
+
+# Debug files
+debug_*.png
+debug_*.html
+
+# Approach experiments
+approach_*.py
+a.py
