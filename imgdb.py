@@ -43,16 +43,15 @@ def check_and_store(results):
 
     Returns the number of flagged listings.
     """
-    db = _load_db()  # {phash_str: [{"pid": int, "title": str, "image_id": str}, ...]}
+    db = _load_db()  # {phash_str: [{"pid": int, "image_id": str}, ...]}
 
-    # Download & hash first images concurrently
     to_check = []
     for r in results:
         image_ids = r.get("image_ids", [])
         if image_ids:
             to_check.append((r, image_ids[0]))
 
-    hashes = {}  # pid -> hash_str
+    hashes = {}  # pid -> (hash_str, img_id)
 
     def _fetch(item):
         post, img_id = item
@@ -60,13 +59,14 @@ def check_and_store(results):
         return post["pid"], h, img_id
 
     with ThreadPoolExecutor(max_workers=10) as pool:
-        futures = [pool.submit(_fetch, item) for item in to_check]
+        futures = {pool.submit(_fetch, item): item for item in to_check}
         for future in as_completed(futures):
             try:
                 pid, hash_str, img_id = future.result()
                 hashes[pid] = (hash_str, img_id)
-            except Exception:
-                pass
+            except Exception as e:
+                failed_pid = futures[future][0]["pid"]
+                print(f"  Image hash failed for PID {failed_pid}: {e}")
 
     flagged = 0
 
@@ -77,14 +77,12 @@ def check_and_store(results):
 
         hash_str, img_id = hashes[pid]
         current_hash = imagehash.hex_to_hash(hash_str)
-        title = r.get("title", "")
 
         # Check against all known hashes
         matches = []
         for stored_hash_str, entries in db.items():
             stored_hash = imagehash.hex_to_hash(stored_hash_str)
-            distance = current_hash - stored_hash
-            if distance <= HAMMING_THRESHOLD:
+            if current_hash - stored_hash <= HAMMING_THRESHOLD:
                 for entry in entries:
                     if entry["pid"] != pid:
                         matches.append(entry["pid"])
@@ -94,9 +92,8 @@ def check_and_store(results):
             flagged += 1
 
         # Store this image in the DB
-        entry = {"pid": pid, "title": title, "image_id": img_id}
+        entry = {"pid": pid, "image_id": img_id}
         if hash_str in db:
-            # Don't duplicate same PID
             if not any(e["pid"] == pid for e in db[hash_str]):
                 db[hash_str].append(entry)
         else:

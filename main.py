@@ -1,11 +1,9 @@
 import json
-import re
 import webbrowser
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from statistics import median
 from urllib.parse import quote
 
 import anthropic
@@ -17,12 +15,45 @@ from textual import work
 
 import craigslist
 import imgdb
+from filters import detect_scam_flags, is_excluded_area, point_in_polygon, COMPANY_ZONE
 
 STATE_FILE = Path(__file__).parent / ".houseme_state.json"
+COMPANY_SUBSIDY = 750
 
-def _get_applicant_info():
+
+# ---------------------------------------------------------------------------
+# Search options
+# ---------------------------------------------------------------------------
+@dataclass
+class SearchOpts:
+    site: str = "sfbay"
+    area: str = "sfc"
+    query: str | None = None
+    limit: int = 25
+    extra_params: dict = field(default_factory=dict)
+    delphi_pays_rent: bool = False
+    exclude_drug_houses: bool = False
+    max_age: int | None = None
+    fetch_emails: bool = False
+    has_images: bool = False
+    applicant_info: str = ""
+
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+def _load_state():
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text())
+    return {"disliked": [], "contacted": [], "contacted_meta": {}}
+
+
+def _save_state(state):
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+def _get_applicant_info(state):
     """Load applicant info from state, or prompt on first run."""
-    state = _load_state()
     info = state.get("applicant")
     if info:
         return f"Name: {info['name']}\nRole: {info['role']}\nAvailability: {info['availability']}"
@@ -37,213 +68,132 @@ def _get_applicant_info():
     click.echo()
     return f"Name: {name}\nRole: {role}\nAvailability: {availability}"
 
-COMPANY_ZONE = [
-    (37.800, -122.441), (37.806, -122.422), (37.808, -122.418),
-    (37.808, -122.410), (37.808, -122.403), (37.798, -122.398),
-    (37.792, -122.394), (37.787, -122.391), (37.781, -122.390),
-    (37.778, -122.392), (37.776, -122.405), (37.775, -122.420),
-    (37.774, -122.435), (37.775, -122.449),
-]
-COMPANY_SUBSIDY = 750
-
-EXCLUDE_HOODS_BY_NAME = {
-    "tenderloin", "mid-market", "bayview", "civic center",
-    "excelsior / outer mission", "visitacion valley",
-}
-
-EXCLUDE_GEO_ZONES = [
-    (37.7805, 37.7870, -122.4190, -122.4070),
-    (37.7790, 37.7845, -122.4110, -122.4040),
-    (37.7785, 37.7815, -122.4200, -122.4130),
-    (37.7270, 37.7420, -122.3970, -122.3720),
-    (37.7760, 37.7810, -122.4200, -122.4100),
-]
-
 
 # ---------------------------------------------------------------------------
-# State
+# Pipeline stages
 # ---------------------------------------------------------------------------
-def _load_state():
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
-    return {"disliked": [], "contacted": []}
-
-
-def _save_state(state):
-    STATE_FILE.write_text(json.dumps(state, indent=2))
-
-
-# ---------------------------------------------------------------------------
-# Filters & helpers
-# ---------------------------------------------------------------------------
-def _is_excluded_area(post):
-    hood = (post.get("neighborhood") or "").lower()
-    loc = (post.get("location") or "").lower()
-    for bad in EXCLUDE_HOODS_BY_NAME:
-        if bad in hood or bad in loc:
-            return True
-    lat, lon = post.get("lat"), post.get("lon")
-    if lat and lon:
-        for lat_min, lat_max, lon_min, lon_max in EXCLUDE_GEO_ZONES:
-            if lat_min <= lat <= lat_max and lon_min <= lon <= lon_max:
-                return True
-    return False
-
-
-def _normalize_title(title):
-    if not title:
-        return ""
-    t = re.sub(r'[^a-z0-9 ]', '', title.lower())
-    return re.sub(r'\s+', ' ', t).strip()
-
-
-def _detect_scam_flags(results):
-    prices_by_br = {}
-    for r in results:
-        price, br = r.get("price"), r.get("bedrooms")
-        if price and price > 0 and br is not None:
-            prices_by_br.setdefault(br, []).append(price)
-
-    median_by_br = {br: median(p) for br, p in prices_by_br.items() if len(p) >= 3}
-    all_prices = [r["price"] for r in results if r.get("price") and r["price"] > 0]
-    overall_median = median(all_prices) if len(all_prices) >= 3 else None
-
-    title_counts = Counter()
-    for r in results:
-        norm = _normalize_title(r.get("title"))
-        if norm and len(norm) > 10:
-            title_counts[norm] += 1
-    repost_titles = {t for t, c in title_counts.items() if c > 1}
-
-    now = datetime.now(timezone.utc)
-    for r in results:
-        flags = []
-        price, br = r.get("price"), r.get("bedrooms")
-        norm_title = _normalize_title(r.get("title"))
-        if price and price > 0:
-            ref = median_by_br.get(br, overall_median)
-            if ref and price < ref * 0.5:
-                flags.append("LOW $")
-        if not r.get("image_count"):
-            flags.append("NO IMG")
-        if norm_title and len(norm_title) > 10 and norm_title in repost_titles:
-            flags.append("REPOST")
-        posted = r.get("posted_date")
-        if posted and (now - posted).days > 14:
-            flags.append("STALE")
-        r["flags"] = flags
-
-
-def point_in_polygon(lat, lon, polygon):
-    n = len(polygon)
-    inside = False
-    j = n - 1
-    for i in range(n):
-        yi, xi = polygon[i]
-        yj, xj = polygon[j]
-        if ((yi > lat) != (yj > lat)) and (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi):
-            inside = not inside
-        j = i
-    return inside
-
-
-# ---------------------------------------------------------------------------
-# Pipeline: fetch → filter → scam check → image check → draft emails
-# ---------------------------------------------------------------------------
-def fetch_and_process(search_opts, offset=0, seen_pids=None):
-    """Run the full pipeline. Returns (new_results, total, next_offset).
-
-    search_opts: dict with site, area, query, extra_params, delphi_pays_rent,
-                 exclude_drug_houses, max_age, fetch_emails, limit.
-    offset: CL API offset for pagination.
-    seen_pids: set of PIDs already displayed (to avoid duplicates).
-    """
-    if seen_pids is None:
-        seen_pids = set()
-
-    site = search_opts["site"]
-    area = search_opts["area"]
-    query = search_opts["query"]
-    limit = search_opts["limit"]
-    extra_params = search_opts["extra_params"]
-    delphi_pays_rent = search_opts["delphi_pays_rent"]
-    exclude_drug_houses = search_opts["exclude_drug_houses"]
-    max_age = search_opts["max_age"]
-    fetch_emails = search_opts["fetch_emails"]
-    applicant_info = search_opts["applicant_info"]
-
-    state = _load_state()
-    hidden_pids = set(state["disliked"] + state["contacted"])
-
+def _fetch_and_filter(opts: SearchOpts, offset: int, seen_pids: set, hidden_pids: set):
+    """Fetch from CL API and apply all filters. Returns (filtered_results, total, next_offset)."""
     collected = []
+    total = 0
     current_offset = offset
 
-    # Keep fetching pages until we have enough results after filtering
-    while len(collected) < limit:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=opts.max_age)) if opts.max_age is not None else None
+
+    while len(collected) < opts.limit:
         raw, total = craigslist.search(
-            site=site, area=area, category="apa",
-            query=query, offset=current_offset, **extra_params,
+            site=opts.site, area=opts.area, category="apa",
+            query=opts.query, offset=current_offset, **opts.extra_params,
         )
 
         if not raw:
             break
 
         current_offset += len(raw)
+        click.echo(f"  Fetched {len(raw)} from CL (total: {total})", err=True)
 
-        # Apply filters
-        if max_age is not None:
-            cutoff = datetime.now(timezone.utc) - timedelta(days=max_age)
+        if cutoff is not None:
+            before = len(raw)
             raw = [r for r in raw if r.get("posted_date") and r["posted_date"] >= cutoff]
+            if len(raw) != before:
+                click.echo(f"    max_age: {before} → {len(raw)}", err=True)
 
-        if exclude_drug_houses:
-            raw = [r for r in raw if not _is_excluded_area(r)]
+        if opts.exclude_drug_houses:
+            before = len(raw)
+            raw = [r for r in raw if not is_excluded_area(r)]
+            if len(raw) != before:
+                click.echo(f"    exclude_drug_houses: {before} → {len(raw)}", err=True)
 
-        if delphi_pays_rent:
+        if opts.delphi_pays_rent:
+            before = len(raw)
+            no_coords = [r for r in raw if not (r.get("lat") and r.get("lon"))]
             raw = [
                 r for r in raw
                 if r.get("lat") and r.get("lon")
                 and point_in_polygon(r["lat"], r["lon"], COMPANY_ZONE)
             ]
+            if len(raw) != before:
+                click.echo(f"    delphi_pays_rent: {before} → {len(raw)} ({len(no_coords)} had no coords)", err=True)
 
-        # Remove hidden and already-seen
+        if opts.has_images:
+            before = len(raw)
+            raw = [r for r in raw if r.get("image_count")]
+            if len(raw) != before:
+                click.echo(f"    has_images: {before} → {len(raw)}", err=True)
+
+        before = len(raw)
         raw = [r for r in raw if r["pid"] not in hidden_pids and r["pid"] not in seen_pids]
-
+        if len(raw) != before:
+            click.echo(f"    hidden/seen: {before} → {len(raw)}", err=True)
         collected.extend(raw)
 
-        # Don't fetch more than exists
         if current_offset >= total:
             break
 
-    # Trim to limit
-    collected = collected[:limit]
+    return collected[:opts.limit], total, current_offset
 
-    if not collected:
-        return [], total, current_offset
 
-    # Scam flags
-    _detect_scam_flags(collected)
-
-    # Image fingerprint check
-    imgdb.check_and_store(collected)
-    for r in collected:
+def _flag_scams_and_dupes(results):
+    """Run scam detection and image fingerprinting on results."""
+    detect_scam_flags(results)
+    imgdb.check_and_store(results)
+    for r in results:
         if r.get("img_reuse_pids"):
             r["flags"].append("DUPE IMG")
 
-    # Fetch reply emails
-    if fetch_emails:
-        from approach_cdp import ensure_cdp, get_reply_email
-        ensure_cdp()
-        for post in collected:
-            try:
-                post["reply_email"] = get_reply_email(post["url"], verbose=False)
-            except Exception:
-                post["reply_email"] = None
 
-    # Draft emails via Haiku (concurrent)
+def _fetch_reply_emails(results):
+    """Fetch CL reply emails via Chrome CDP."""
+    from approach_cdp import ensure_cdp, get_reply_email
+    ensure_cdp()
+    for post in results:
+        try:
+            post["reply_email"] = get_reply_email(post["url"], verbose=False)
+        except Exception:
+            post["reply_email"] = None
+
+
+EMAIL_PROMPT = """\
+Write an email requesting to visit this apartment. Match the tone and structure of this example EXACTLY:
+
+---
+Hi,
+
+I'm interested in viewing the 1-bedroom apartment in Nob Hill.
+I am an AI engineer, working at Delphi - SF-based startup, and can move in as soon as possible
+
+I would like to schedule a visit at your earliest convenience.
+Please let me know what times work for you.
+
+Thanks,
+{first_name}
+---
+
+Rules:
+- DON'T introduce yourself by full name in the body (only sign off with first name)
+- DON'T say 'My name is' or lead with your name
+- Mention occupation and company casually mid-sentence, not as a formal introduction
+- Keep it short, natural, no fluff
+- Adapt the listing details (BR count, neighborhood) but keep the same structure
+
+APPLICANT:
+{applicant_info}
+
+LISTING:
+{listing_info}
+
+Output the email in this exact format:
+SUBJECT: <short clean subject line>
+
+<email body>
+The subject should be simple like 'Interested in 1BD in Nob Hill'. No spammy CL title copy-paste."""
+
+
+def _draft_emails(results, applicant_info, first_name):
+    """Draft visit request emails via Haiku, concurrently."""
     client = anthropic.Anthropic()
-    first_name = applicant_info.split("\n")[0].split(":")[1].strip().split()[0]
 
-    def _draft_email(post):
+    def _draft_one(post):
         price = post.get("price")
         price_str = f"${price:,}/mo" if price else "N/A"
         listing_info = (
@@ -251,60 +201,65 @@ def fetch_and_process(search_opts, offset=0, seen_pids=None):
             f"Price: {price_str}\n"
             f"Bedrooms: {post.get('bedrooms', 'N/A')}\n"
             f"Sqft: {post.get('sqft', 'N/A')}\n"
-            f"Location: {post.get('location', '')} {post.get('neighborhood', '') or ''}\n"
+            f"Location: {post.get('location', '')} {post.get('neighborhood') or ''}\n"
             f"URL: {post.get('url', '')}"
         )
         resp = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=400,
-            messages=[{"role": "user", "content": (
-                "Write an email requesting to visit this apartment. Match the tone and structure of this example EXACTLY:\n\n"
-                "---\n"
-                "Hi,\n\n"
-                "I'm interested in viewing the 1-bedroom apartment in Nob Hill.\n"
-                "I am an AI engineer, working at Delphi - SF-based startup, and can move in as soon as possible\n\n"
-                "I would like to schedule a visit at your earliest convenience.\n"
-                "Please let me know what times work for you.\n\n"
-                f"Thanks,\n{first_name}\n"
-                "---\n\n"
-                "Rules:\n"
-                "- DON'T introduce yourself by full name in the body (only sign off with first name)\n"
-                "- DON'T say 'My name is' or lead with your name\n"
-                "- Mention occupation and company casually mid-sentence, not as a formal introduction\n"
-                "- Keep it short, natural, no fluff\n"
-                "- Adapt the listing details (BR count, neighborhood) but keep the same structure\n\n"
-                f"APPLICANT:\n{applicant_info}\n\n"
-                f"LISTING:\n{listing_info}\n\n"
-                "Output the email in this exact format:\n"
-                "SUBJECT: <short clean subject line>\n\n<email body>\n"
-                "The subject should be simple like 'Interested in 1BD in Nob Hill'. No spammy CL title copy-paste."
+            messages=[{"role": "user", "content": EMAIL_PROMPT.format(
+                first_name=first_name,
+                applicant_info=applicant_info,
+                listing_info=listing_info,
             )}],
         )
-        raw = resp.content[0].text.strip()
-        if raw.upper().startswith("SUBJECT:"):
-            first_line, _, email_body = raw.partition("\n")
+        raw_text = resp.content[0].text.strip()
+        if raw_text.upper().startswith("SUBJECT:"):
+            first_line, _, email_body = raw_text.partition("\n")
             subject_text = first_line.split(":", 1)[1].strip()
             email_body = email_body.strip()
         else:
             subject_text = f"Interested in apartment in {post.get('neighborhood') or post.get('location') or 'SF'}"
-            email_body = raw
-        subject = quote(subject_text)
-        body = quote(email_body)
-        reply_email = post.get("reply_email", "")
+            email_body = raw_text
+
+        reply_email = post.get("reply_email") or ""
         post["_gmail_url"] = (
             f"https://mail.google.com/mail/?view=cm&fs=1"
-            f"&to={quote(reply_email)}&su={subject}&body={body}"
+            f"&to={quote(reply_email)}&su={quote(subject_text)}&body={quote(email_body)}"
         )
 
     with ThreadPoolExecutor(max_workers=10) as pool:
-        futures = {pool.submit(_draft_email, post): post for post in collected}
+        futures = {pool.submit(_draft_one, post): post for post in results}
         for future in as_completed(futures):
             try:
                 future.result()
-            except Exception:
+            except Exception as e:
+                print(f"  Draft failed for PID {futures[future].get('pid')}: {e}")
                 futures[future]["_gmail_url"] = ""
 
-    return collected, total, current_offset
+
+def fetch_and_process(opts: SearchOpts, offset=0, seen_pids=None):
+    """Full pipeline: fetch -> filter -> flag -> draft. Returns (results, total, next_offset)."""
+    if seen_pids is None:
+        seen_pids = set()
+
+    state = _load_state()
+    hidden_pids = set(state["disliked"] + state["contacted"])
+
+    results, total, next_offset = _fetch_and_filter(opts, offset, seen_pids, hidden_pids)
+    if not results:
+        return [], total, next_offset
+
+    _flag_scams_and_dupes(results)
+
+    if opts.fetch_emails:
+        _fetch_reply_emails(results)
+
+    name_parts = state.get("applicant", {}).get("name", "").split()
+    first_name = name_parts[0] if name_parts else "Applicant"
+    _draft_emails(results, opts.applicant_info, first_name)
+
+    return results, total, next_offset
 
 
 # ---------------------------------------------------------------------------
@@ -325,16 +280,17 @@ class HouseMeApp(App):
         Binding("q", "quit", "Quit"),
     ]
 
-    def __init__(self, results, total, search_opts, offset, delphi_pays_rent, filters_desc, **kwargs):
+    def __init__(self, results, total, opts: SearchOpts, delphi_pays_rent, filters_desc, **kwargs):
         super().__init__(**kwargs)
         self.results = list(results)
         self.total = total
-        self.search_opts = search_opts
-        self.offset = offset
+        self.opts = opts
         self.delphi_pays_rent = delphi_pays_rent
         self.filters_desc = filters_desc
         self.state = _load_state()
+        self._pid_to_post = {p["pid"]: p for p in self.results}
         self._pid_by_row_key = {}
+        self._dismissed_pids: set[int] = set()
         self._loading = False
 
     def compose(self) -> ComposeResult:
@@ -384,16 +340,18 @@ class HouseMeApp(App):
             return None
         row_key = list(table.rows.keys())[table.cursor_row]
         pid = self._pid_by_row_key.get(row_key)
-        for post in self.results:
-            if post["pid"] == pid:
-                return post
-        return None
+        return self._pid_to_post.get(pid)
 
     def _remove_current_row(self):
         table = self.query_one(DataTable)
         if table.row_count == 0:
             return
         row_key = list(table.rows.keys())[table.cursor_row]
+        pid = self._pid_by_row_key.pop(row_key, None)
+        if pid:
+            self._pid_to_post.pop(pid, None)
+            self.results = [r for r in self.results if r["pid"] != pid]
+            self._dismissed_pids.add(pid)
         table.remove_row(row_key)
 
     def action_dislike(self):
@@ -414,6 +372,8 @@ class HouseMeApp(App):
         pid = post["pid"]
         if pid not in self.state["contacted"]:
             self.state["contacted"].append(pid)
+            meta = self.state.setdefault("contacted_meta", {})
+            meta[str(pid)] = {"title": post.get("title", ""), "url": post.get("url", "")}
             _save_state(self.state)
         self._remove_current_row()
         self.notify("Marked as contacted", severity="information")
@@ -448,15 +408,16 @@ class HouseMeApp(App):
 
     @work(thread=True)
     def _do_load_more(self):
-        seen_pids = {p["pid"] for p in self.results}
-        new_results, total, new_offset = fetch_and_process(
-            self.search_opts, offset=self.offset, seen_pids=seen_pids,
+        seen_pids = {p["pid"] for p in self.results} | self._dismissed_pids
+        new_results, total, _ = fetch_and_process(
+            self.opts, offset=0, seen_pids=seen_pids,
         )
-        self.offset = new_offset
         self.total = total
 
         if new_results:
             self.results.extend(new_results)
+            for p in new_results:
+                self._pid_to_post[p["pid"]] = p
             self.call_from_thread(self._add_rows, new_results)
             self.call_from_thread(
                 self.notify, f"Loaded {len(new_results)} more listings"
@@ -497,34 +458,30 @@ def cli():
 @click.option("--exclude-drug-houses", is_flag=True, help="Exclude bad neighborhoods.")
 @click.option("--max-age", default=None, type=int, help="Max posting age in days.")
 @click.option("--fetch-emails", is_flag=True, help="Fetch reply emails via CDP.")
+@click.option("--has-images", is_flag=True, help="Only show listings with photos.")
 def search(site, area, query, limit, min_price, max_price, min_bedrooms, max_bedrooms,
-           min_sqft, max_sqft, delphi_pays_rent, exclude_drug_houses, max_age, fetch_emails):
+           min_sqft, max_sqft, delphi_pays_rent, exclude_drug_houses, max_age, fetch_emails, has_images):
     """Search Craigslist apartments for rent."""
 
     extra_params = {}
-    if min_price is not None:
-        extra_params["min_price"] = min_price
-    if max_price is not None:
-        extra_params["max_price"] = max_price
-    if min_bedrooms is not None:
-        extra_params["min_bedrooms"] = min_bedrooms
-    if max_bedrooms is not None:
-        extra_params["max_bedrooms"] = max_bedrooms
-    if min_sqft is not None:
-        extra_params["min_sqft"] = min_sqft
-    if max_sqft is not None:
-        extra_params["max_sqft"] = max_sqft
+    for key, val in [("min_price", min_price), ("max_price", max_price),
+                     ("min_bedrooms", min_bedrooms), ("max_bedrooms", max_bedrooms),
+                     ("min_sqft", min_sqft), ("max_sqft", max_sqft)]:
+        if val is not None:
+            extra_params[key] = val
 
-    applicant_info = _get_applicant_info()
+    state = _load_state()
+    applicant_info = _get_applicant_info(state)
 
-    search_opts = {
-        "site": site, "area": area, "query": query, "limit": limit,
-        "extra_params": extra_params, "delphi_pays_rent": delphi_pays_rent,
-        "exclude_drug_houses": exclude_drug_houses, "max_age": max_age,
-        "fetch_emails": fetch_emails, "applicant_info": applicant_info,
-    }
+    opts = SearchOpts(
+        site=site, area=area, query=query, limit=limit,
+        extra_params=extra_params, delphi_pays_rent=delphi_pays_rent,
+        exclude_drug_houses=exclude_drug_houses, max_age=max_age,
+        fetch_emails=fetch_emails, has_images=has_images,
+        applicant_info=applicant_info,
+    )
 
-    results, total, offset = fetch_and_process(search_opts)
+    results, total, _ = fetch_and_process(opts)
 
     if not results:
         click.echo("No results found.")
@@ -537,13 +494,12 @@ def search(site, area, query, limit, min_price, max_price, min_bedrooms, max_bed
         filters.append("delphi zone")
     if exclude_drug_houses:
         filters.append("bad hoods excluded")
-    state = _load_state()
     hidden = len(state["disliked"]) + len(state["contacted"])
     if hidden:
         filters.append(f"{hidden} hidden")
     filters_desc = ", ".join(filters) if filters else ""
 
-    app = HouseMeApp(results, total, search_opts, offset, delphi_pays_rent, filters_desc)
+    app = HouseMeApp(results, total, opts, delphi_pays_rent, filters_desc)
     app.run()
 
 
@@ -557,10 +513,16 @@ def contacted():
         click.echo("No contacted listings.")
         return
 
+    meta = state.get("contacted_meta", {})
     click.echo(f"\n  {len(pids)} contacted listing(s):\n")
     for i, pid in enumerate(pids, 1):
-        url = f"https://sfbay.craigslist.org/search/apa?pid={pid}"
-        click.echo(f"  {i}. PID {pid}  —  https://sfbay.craigslist.org/sfc/apa/d/listing/{pid}.html")
+        info = meta.get(str(pid), {})
+        title = info.get("title", "unknown")
+        url = info.get("url", "")
+        if url:
+            click.echo(f"  {i}. {title}  —  {url}")
+        else:
+            click.echo(f"  {i}. PID {pid}")
 
     click.echo()
     raw = click.prompt(
@@ -586,9 +548,12 @@ def contacted():
 
     reverted = []
     for n in sorted(to_revert, reverse=True):
-        reverted.append(pids.pop(n - 1))
+        pid = pids.pop(n - 1)
+        reverted.append(pid)
+        meta.pop(str(pid), None)
 
     state["contacted"] = pids
+    state["contacted_meta"] = meta
     _save_state(state)
     click.echo(f"  Reverted {len(reverted)} listing(s) — they'll show up in future searches again.")
 

@@ -111,9 +111,10 @@ Clicking `e` opens Gmail compose with subject + body pre-filled. With `--fetch-e
 
 | File | Purpose |
 |------|---------|
-| `main.py` | CLI + TUI app |
+| `main.py` | CLI + TUI app, email drafting pipeline |
 | `craigslist.py` | CL search API client (via FlareSolverr) |
+| `filters.py` | Geo filtering, neighborhood exclusion, scam detection |
 | `imgdb.py` | Perceptual image hash database |
 | `approach_cdp.py`* | Chrome CDP email extraction (not committed) |
 
-\* Create your own `approach_cdp.py` if you want `--fetch-emails` support. It needs to export `ensure_cdp()` and `get_reply_email(url)`.
+\* Create your own `approach_cdp.py` if you want `--fetch-emails` support (`pip install playwright`). It needs to export `ensure_cdp()` and `get_reply_email(url)`.

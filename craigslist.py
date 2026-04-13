@@ -1,6 +1,7 @@
 import json
 import re
 from datetime import datetime, timezone
+from functools import lru_cache
 from urllib.parse import urlencode
 
 import requests
@@ -13,7 +14,6 @@ _TAG_IMAGE_IDS = 4
 _TAG_HOUSING = 5
 _TAG_SEO = 6
 _TAG_PRICE_STR = 10
-_TAG_UUID = 13
 
 
 def flaresolverr_get(url, max_timeout=60000):
@@ -29,6 +29,7 @@ def flaresolverr_get(url, max_timeout=60000):
     return data["solution"]["response"]
 
 
+@lru_cache(maxsize=16)
 def _get_area_id(site, area=None):
     """Get the areaId by loading a search page and extracting it from the init script."""
     path = f"/search/{area}/sss" if area else "/search/sss"
@@ -91,7 +92,6 @@ def _decode_items(data, category_abbr="apa"):
             "neighborhood": neighborhood,
             "lat": lat,
             "lon": lon,
-            "_loc_info": loc_info,
         }
 
         title = None
@@ -114,8 +114,6 @@ def _decode_items(data, category_abbr="apa"):
                         img_id.split(":", 1)[-1] for img_id in field[1:]
                         if isinstance(img_id, str)
                     ]
-                elif tag == _TAG_UUID:
-                    result["uuid"] = field[1] if len(field) > 1 else None
 
         result["title"] = title
 
