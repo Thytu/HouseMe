@@ -1,7 +1,11 @@
 import html
+import http.server
 import io
 import json
+import re
+import socketserver
 import tempfile
+import threading
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -729,6 +733,15 @@ class HouseMeApp(App):
                 f".addTo(map).bindPopup('{popup}');\n"
             )
 
+        zone_js = ""
+        if self.delphi_pays_rent:
+            coords = ", ".join(f"[{lat}, {lon}]" for lat, lon in COMPANY_ZONE)
+            zone_js = (
+                f"L.polygon([{coords}], "
+                f"{{color: '#2196F3', weight: 2, fillOpacity: 0.08}})"
+                f".addTo(map).bindPopup('Delphi subsidy zone');\n"
+            )
+
         avg_lat = sum(p["lat"] for p in posts) / len(posts)
         avg_lon = sum(p["lon"] for p in posts) / len(posts)
 
@@ -752,7 +765,7 @@ L.tileLayer('https://{{s}}.basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}
   maxZoom: 20,
   subdomains: 'abcd'
 }}).addTo(map);
-{markers_js}
+{zone_js}{markers_js}
 </script>
 </body>
 </html>"""
@@ -922,6 +935,201 @@ def contacted():
     state["contacted_meta"] = meta
     _save_state(state)
     click.echo(f"  Reverted {len(reverted)} listing(s) — they'll show up in future searches again.")
+
+
+ZONE_EDITOR_HTML = """\
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>HouseMe — Edit Subsidy Zone</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+html, body { height: 100%; margin: 0; font-family: system-ui, sans-serif; }
+#map { height: 100%; }
+#toolbar {
+  position: absolute; top: 10px; right: 10px; z-index: 1000;
+  background: white; padding: 12px; border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.25); max-width: 260px;
+}
+#toolbar button {
+  display: block; width: 100%; padding: 8px 12px; margin: 4px 0;
+  border: 1px solid #ccc; border-radius: 4px; cursor: pointer;
+  font-size: 14px; background: #f8f8f8;
+}
+#toolbar button:hover { background: #e8e8e8; }
+#toolbar button.primary { background: #2196F3; color: white; border-color: #1976D2; }
+#toolbar button.primary:hover { background: #1976D2; }
+#toolbar button.danger { background: #f44336; color: white; border-color: #d32f2f; }
+#toolbar button.danger:hover { background: #d32f2f; }
+#status { font-size: 13px; color: #666; margin-top: 8px; }
+#vertex-count { font-weight: bold; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="toolbar">
+  <div style="font-weight:bold; margin-bottom:8px;">Zone Editor</div>
+  <div style="font-size:13px; color:#666; margin-bottom:8px;">
+    Click on the map to place vertices.<br>
+    The polygon closes automatically.
+  </div>
+  <button onclick="undo()">Undo last point</button>
+  <button onclick="clearAll()" class="danger">Clear all</button>
+  <button onclick="save()" class="primary">Save zone</button>
+  <div id="status"><span id="vertex-count">0</span> vertices</div>
+</div>
+<script>
+var map = L.map('map').setView([CENTERLATLON], 13);
+L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+  attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
+  maxZoom: 20, subdomains: 'abcd'
+}).addTo(map);
+
+// Show existing zone in blue (dashed)
+var existingCoords = EXISTING_COORDS;
+if (existingCoords.length > 0) {
+  L.polygon(existingCoords, {
+    color: '#90CAF9', weight: 2, dashArray: '6 4', fillOpacity: 0.05, interactive: false
+  }).addTo(map);
+}
+
+var vertices = [];
+var markers = [];
+var polygon = null;
+
+function updatePolygon() {
+  if (polygon) map.removeLayer(polygon);
+  if (vertices.length >= 3) {
+    polygon = L.polygon(vertices, {
+      color: '#2196F3', weight: 2, fillOpacity: 0.15
+    }).addTo(map);
+  } else if (vertices.length >= 2) {
+    polygon = L.polyline(vertices, {color: '#2196F3', weight: 2}).addTo(map);
+  } else {
+    polygon = null;
+  }
+  document.getElementById('vertex-count').textContent = vertices.length;
+}
+
+map.on('click', function(e) {
+  var latlng = [Math.round(e.latlng.lat * 10000) / 10000, Math.round(e.latlng.lng * 10000) / 10000];
+  vertices.push(latlng);
+  var marker = L.circleMarker(latlng, {
+    radius: 6, color: '#2196F3', fillColor: '#fff', fillOpacity: 1, weight: 2
+  }).addTo(map).bindTooltip(vertices.length.toString(), {permanent: true, direction: 'right', offset: [8, 0]});
+  markers.push(marker);
+  updatePolygon();
+});
+
+function undo() {
+  if (vertices.length === 0) return;
+  vertices.pop();
+  var m = markers.pop();
+  if (m) map.removeLayer(m);
+  updatePolygon();
+}
+
+function clearAll() {
+  vertices = [];
+  markers.forEach(function(m) { map.removeLayer(m); });
+  markers = [];
+  updatePolygon();
+}
+
+function save() {
+  if (vertices.length < 3) {
+    alert('Need at least 3 vertices to form a polygon.');
+    return;
+  }
+  fetch('/save', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({coordinates: vertices})
+  }).then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.ok) {
+        document.getElementById('status').innerHTML =
+          '<span style="color:green; font-weight:bold;">Saved! You can close this tab.</span>';
+      }
+    });
+}
+</script>
+</body>
+</html>"""
+
+FILTERS_PY = Path(__file__).parent / "filters.py"
+
+
+def _write_zone_to_filters(coords: list[list[float]]) -> None:
+    """Replace COMPANY_ZONE in filters.py with new coordinates."""
+    source = FILTERS_PY.read_text()
+    lines = [f"    ({lat}, {lon})," for lat, lon in coords]
+    new_block = "COMPANY_ZONE = [\n" + "\n".join(lines) + "\n]"
+    updated = re.sub(
+        r"COMPANY_ZONE\s*=\s*\[.*?\]",
+        new_block,
+        source,
+        flags=re.DOTALL,
+    )
+    FILTERS_PY.write_text(updated)
+
+
+@cli.command("edit-zone")
+def edit_zone():
+    """Open a browser-based editor to draw the company subsidy zone polygon."""
+    existing = json.dumps([[lat, lon] for lat, lon in COMPANY_ZONE])
+    if COMPANY_ZONE:
+        center_lat = sum(p[0] for p in COMPANY_ZONE) / len(COMPANY_ZONE)
+        center_lon = sum(p[1] for p in COMPANY_ZONE) / len(COMPANY_ZONE)
+    else:
+        center_lat, center_lon = 37.79, -122.42
+
+    page = (
+        ZONE_EDITOR_HTML
+        .replace("EXISTING_COORDS", existing)
+        .replace("CENTERLATLON", f"{center_lat}, {center_lon}")
+    )
+
+    saved_event = threading.Event()
+    new_coords: list[list[float]] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(page.encode())
+
+        def do_POST(self) -> None:
+            length = int(self.headers["Content-Length"])
+            data = json.loads(self.rfile.read(length))
+            new_coords.extend(data["coordinates"])
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok": true}')
+            saved_event.set()
+
+        def log_message(self, fmt: str, *args: object) -> None:
+            pass
+
+    port = 8234
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.TCPServer(("127.0.0.1", port), Handler) as httpd:
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        webbrowser.open(f"http://localhost:{port}")
+        click.echo(f"  Zone editor open at http://localhost:{port}")
+        click.echo("  Draw the polygon in the browser, then click Save.")
+        click.echo("  Waiting...")
+        saved_event.wait()
+        httpd.shutdown()
+
+    _write_zone_to_filters(new_coords)
+    click.echo(f"  Saved {len(new_coords)} vertices to filters.py")
 
 
 if __name__ == "__main__":
