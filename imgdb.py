@@ -76,19 +76,23 @@ def check_and_store(results):
             continue
 
         hash_str, img_id = hashes[pid]
+        r["_image_hash"] = hash_str
         current_hash = imagehash.hex_to_hash(hash_str)
 
         # Check against all known hashes
         matches = []
+        match_count = 0
         for stored_hash_str, entries in db.items():
             stored_hash = imagehash.hex_to_hash(stored_hash_str)
             if current_hash - stored_hash <= HAMMING_THRESHOLD:
                 for entry in entries:
+                    match_count += 1
                     if entry["pid"] != pid:
                         matches.append(entry["pid"])
 
         if matches:
             r["img_reuse_pids"] = matches
+            r["_image_reuse_count"] = match_count
             flagged += 1
 
         # Store this image in the DB

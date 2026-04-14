@@ -1,5 +1,7 @@
+import html
 import io
 import json
+import tempfile
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -16,6 +18,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.screen import Screen
+from textual.containers import Container
 from textual.widgets import DataTable, Footer, Header, Static
 from textual_image.widget import Image as ImageWidget
 
@@ -143,12 +146,14 @@ def _fetch_and_filter(opts: SearchOpts, offset: int, seen_pids: set, hidden_pids
 
 
 def _flag_scams_and_dupes(results):
-    """Run scam detection and image fingerprinting on results."""
-    detect_scam_flags(results)
+    """Run image fingerprinting then scam detection (order matters).
+
+    imgdb runs first to populate _image_hash / img_reuse_pids / _image_reuse_count,
+    then detect_scam_flags uses all available data (including image signals) to
+    assign flags.
+    """
     imgdb.check_and_store(results)
-    for r in results:
-        if r.get("img_reuse_pids"):
-            r["flags"].append("DUPE IMG")
+    detect_scam_flags(results)
 
 
 def _fetch_reply_emails(results):
@@ -300,9 +305,14 @@ class ListingDetailScreen(Screen):
         padding: 0 1;
         background: $surface;
     }
-    #detail-image {
+    #image-container {
         width: 1fr;
         height: 1fr;
+        align: center middle;
+    }
+    #detail-image {
+        width: auto;
+        height: auto;
     }
     #detail-status {
         width: 1fr;
@@ -329,7 +339,7 @@ class ListingDetailScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static(self._build_meta(), id="detail-meta")
-        yield ImageWidget(id="detail-image", classes="hidden")
+        yield Container(ImageWidget(id="detail-image"), id="image-container", classes="hidden")
         yield Static("", id="detail-status")
         yield Static("", id="detail-counter")
         yield Footer()
@@ -376,7 +386,7 @@ class ListingDetailScreen(Screen):
 
     def _set_status(self, msg: str) -> None:
         """Show status text and hide the image widget."""
-        self.query_one("#detail-image").add_class("hidden")
+        self.query_one("#image-container").add_class("hidden")
         status = self.query_one("#detail-status", Static)
         status.remove_class("hidden")
         status.update(msg)
@@ -384,8 +394,9 @@ class ListingDetailScreen(Screen):
     def _set_image(self, img: Image.Image) -> None:
         """Show an image and hide the status text."""
         self.query_one("#detail-status").add_class("hidden")
+        container = self.query_one("#image-container")
+        container.remove_class("hidden")
         image_widget = self.query_one("#detail-image", ImageWidget)
-        image_widget.remove_class("hidden")
         image_widget.image = img
 
     @work(thread=True)
@@ -473,6 +484,16 @@ class ListingDetailScreen(Screen):
         self.app.pop_screen()
 
 
+_SORT_MODES: list[tuple[str, str | None, bool]] = [
+    ("Default", None, False),
+    ("Price ↑", "price", False),
+    ("Price ↓", "price", True),
+    ("Newest", "posted_date", True),
+    ("Oldest", "posted_date", False),
+    ("Sqft ↓", "sqft", True),
+]
+
+
 class HouseMeApp(App):
     CSS = """
     DataTable { height: 1fr; }
@@ -485,6 +506,9 @@ class HouseMeApp(App):
         Binding("e", "open_draft", "Email draft"),
         Binding("o", "open_listing", "Open listing"),
         Binding("l", "load_more", "Load more"),
+        Binding("s", "cycle_sort", "Sort"),
+        Binding("f", "toggle_flagged", "Hide flagged"),
+        Binding("m", "open_map", "Map"),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -500,6 +524,8 @@ class HouseMeApp(App):
         self._pid_by_row_key = {}
         self._dismissed_pids: set[int] = set()
         self._loading = False
+        self._sort_mode: int = 0
+        self._hide_flagged: bool = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -508,7 +534,6 @@ class HouseMeApp(App):
 
     def on_mount(self):
         self.title = f"HouseMe — {self.total:,} listings"
-        self.sub_title = self.filters_desc or "All listings"
 
         table = self.query_one(DataTable)
         cols = ["Rent"]
@@ -517,7 +542,8 @@ class HouseMeApp(App):
         cols += ["BR", "Sqft", "Title", "Location", "Posted", "Flags"]
         table.add_columns(*cols)
 
-        self._add_rows(self.results)
+        self._add_rows(self._visible_posts())
+        self._update_subtitle()
 
     def _add_rows(self, posts):
         table = self.query_one(DataTable)
@@ -541,6 +567,57 @@ class HouseMeApp(App):
 
             row_key = table.add_row(*row)
             self._pid_by_row_key[row_key] = post["pid"]
+
+    def _visible_posts(self) -> list[dict]:
+        """Return results after applying current filter and sort."""
+        posts = self.results
+        if self._hide_flagged:
+            posts = [p for p in posts if not p.get("flags")]
+
+        mode_name, sort_key, reverse = _SORT_MODES[self._sort_mode]
+        if sort_key:
+            posts = sorted(posts, key=lambda p: p.get(sort_key) or 0, reverse=reverse)
+
+        return posts
+
+    def _rebuild_table(self) -> None:
+        """Clear and re-populate the table with current sort/filter applied."""
+        table = self.query_one(DataTable)
+        table.clear()
+        self._pid_by_row_key.clear()
+        self._add_rows(self._visible_posts())
+        self._update_subtitle()
+
+    def _update_subtitle(self) -> None:
+        """Update subtitle to reflect active sort/filter state."""
+        parts: list[str] = []
+        if self.filters_desc:
+            parts.append(self.filters_desc)
+
+        mode_name, _, _ = _SORT_MODES[self._sort_mode]
+        if self._sort_mode != 0:
+            parts.append(f"sort: {mode_name}")
+
+        if self._hide_flagged:
+            parts.append("flagged hidden")
+
+        self.sub_title = ", ".join(parts) if parts else "All listings"
+
+    def action_cycle_sort(self) -> None:
+        """Cycle through sort modes."""
+        self._sort_mode = (self._sort_mode + 1) % len(_SORT_MODES)
+        mode_name, _, _ = _SORT_MODES[self._sort_mode]
+        self._rebuild_table()
+        self.notify(f"Sort: {mode_name}")
+
+    def action_toggle_flagged(self) -> None:
+        """Toggle hiding listings that have scam flags."""
+        self._hide_flagged = not self._hide_flagged
+        self._rebuild_table()
+        if self._hide_flagged:
+            self.notify("Hiding flagged listings")
+        else:
+            self.notify("Showing all listings")
 
     def _get_selected_post(self):
         table = self.query_one(DataTable)
@@ -622,6 +699,71 @@ class HouseMeApp(App):
             webbrowser.open(url)
             self.notify("Opening listing...")
 
+    def action_open_map(self) -> None:
+        """Generate a Leaflet.js map of visible listings and open in browser."""
+        posts = [p for p in self._visible_posts() if p.get("lat") and p.get("lon")]
+        if not posts:
+            self.notify("No listings with coordinates", severity="warning")
+            return
+
+        markers_js = ""
+        for p in posts:
+            flags = p.get("flags", [])
+            color = "red" if flags else "green"
+            price_raw = p.get("price")
+            price = p.get("price_str") or (f"${price_raw:,}" if price_raw else "N/A")
+            title = html.escape(p.get("title") or "untitled", quote=True)
+            loc = html.escape(p.get("neighborhood") or p.get("location", ""), quote=True)
+            flags_str = html.escape(" ".join(flags) or "OK", quote=True)
+            url = html.escape(p.get("url", ""), quote=True)
+
+            popup = (
+                f"<b>{title}</b><br>"
+                f"{price} · {loc}<br>"
+                f"Flags: {flags_str}<br>"
+                f"<a href=\\'{url}\\' target=\\'_blank\\'>View listing</a>"
+            )
+            markers_js += (
+                f"L.circleMarker([{p['lat']}, {p['lon']}], "
+                f"{{radius: 8, color: '{color}', fillColor: '{color}', fillOpacity: 0.7}})"
+                f".addTo(map).bindPopup('{popup}');\n"
+            )
+
+        avg_lat = sum(p["lat"] for p in posts) / len(posts)
+        avg_lon = sum(p["lon"] for p in posts) / len(posts)
+
+        map_html = f"""\
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>HouseMe Map — {len(posts)} listings</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>html,body,#map{{height:100%;margin:0;}}</style>
+</head>
+<body>
+<div id="map"></div>
+<script>
+var map = L.map('map').setView([{avg_lat}, {avg_lon}], 13);
+L.tileLayer('https://{{s}}.basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}/{{y}}{{r}}.png', {{
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/">CARTO</a>',
+  maxZoom: 20,
+  subdomains: 'abcd'
+}}).addTo(map);
+{markers_js}
+</script>
+</body>
+</html>"""
+
+        with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False) as f:
+            f.write(map_html)
+            map_path = f.name
+
+        webbrowser.open(f"file://{map_path}")
+        self.notify(f"Map opened with {len(posts)} listings")
+
     def action_load_more(self):
         if self._loading:
             self.notify("Already loading...", severity="warning")
@@ -642,7 +784,7 @@ class HouseMeApp(App):
             self.results.extend(new_results)
             for p in new_results:
                 self._pid_to_post[p["pid"]] = p
-            self.app.call_from_thread(self._add_rows, new_results)
+            self.app.call_from_thread(self._rebuild_table)
             self.app.call_from_thread(
                 self.notify, f"Loaded {len(new_results)} more listings"
             )

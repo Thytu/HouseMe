@@ -1,27 +1,24 @@
 # HouseMe
 
-Craigslist apartment hunter with a TUI, scam detection, and AI-drafted visit request emails.
+I moved to SF and needed an apartment. Craigslist has the inventory but the experience is painful: walls of text, scam listings everywhere, and copy-pasting the same "Hi, I'm interested..." email 40 times.
 
-Built for people relocating to SF who don't want to waste time on scams or copy-pasting emails.
+So I built this. It pulls Craigslist listings into a terminal UI, flags the scams, drafts a personalized visit request email for every listing, and opens it in Gmail with one keystroke. It remembers what you've already seen so you never waste time on the same listing twice.
 
-## What it does
+## What a session looks like
 
-- Searches Craigslist apartments via their internal API (bypasses Cloudflare with FlareSolverr)
-- Shows results in a navigable terminal UI (arrow keys, not a wall of text)
-- Flags scams: below-market pricing, no images, reposts, stale listings, reused photos across listings
-- Drafts a visit request email for every listing using Claude Haiku and opens it in Gmail
-- Remembers what you've already contacted or disliked — never shows them again
-- Filters by price, bedrooms, sqft, posting age, and geographic zones
-- Detects duplicate photos across listings using perceptual hashing (builds up over time)
+```bash
+# Start FlareSolverr (one-time, runs in background)
+docker run -d --name flaresolverr -p 8191:8191 ghcr.io/flaresolverr/flaresolverr
 
-## Prerequisites
+# Search
+uv run python main.py search \
+  --min-price 2200 --max-price 3750 \
+  --min-bedrooms 1 --max-age 7 \
+  --exclude-drug-houses \
+  --has-images
+```
 
-- **Python 3.10+**
-- **[FlareSolverr](https://github.com/FlareSolverr/FlareSolverr)** running on port 8191 (Cloudflare bypass):
-  ```bash
-  docker run -d --name flaresolverr -p 8191:8191 ghcr.io/flaresolverr/flaresolverr
-  ```
-- **Anthropic API key** set as `ANTHROPIC_API_KEY` (for email drafting with Haiku)
+You get a navigable table. Arrow keys to browse, Enter to see photos, `e` to fire off an email, `d` to never see it again. Done in 10 minutes instead of an hour.
 
 ## Setup
 
@@ -31,90 +28,96 @@ cd HouseMe
 uv sync
 ```
 
-On first run, you'll be prompted for your name, occupation, and move-in availability. This is saved locally and used to personalize email drafts.
+Needs **Python 3.10+**, **FlareSolverr** on port 8191, and `ANTHROPIC_API_KEY` set for email drafting.
 
-## Usage
+First run asks your name, job, and move-in date — saved locally, used to personalize emails.
 
-### Search apartments
+## Keybindings
 
-```bash
-uv run python main.py search
-```
+**Listing table:**
 
-With filters:
-
-```bash
-uv run python main.py search \
-  --min-price 2200 \
-  --max-price 3750 \
-  --min-bedrooms 1 \
-  --max-bedrooms 2 \
-  --max-age 14 \
-  --exclude-drug-houses \
-  -n 20
-```
-
-### TUI keybindings
-
-| Key | Action |
-|-----|--------|
-| `up` / `down` | Navigate listings |
+| Key | What it does |
+|-----|-------------|
+| `Enter` | Open detail view with photos |
 | `e` | Open Gmail with AI-drafted visit request |
 | `o` | Open listing in browser |
-| `d` | Dislike — hides from all future runs |
-| `c` | Contacted — hides from all future runs |
-| `l` | Load more listings |
+| `d` | Dislike — gone forever |
+| `c` | Mark as contacted — gone forever |
+| `s` | Cycle sort: price, date, sqft |
+| `f` | Toggle hiding flagged listings |
+| `m` | Open map of all visible listings in browser |
+| `l` | Load more results |
 | `q` | Quit |
 
-### Manage contacted listings
+**Detail view:**
 
-```bash
-# List all contacted listings
-uv run python main.py contacted
+| Key | What it does |
+|-----|-------------|
+| `Left` / `Right` | Browse photos |
+| `d` / `c` / `e` / `o` | Same as table |
+| `Escape` | Back |
 
-# You'll be prompted to un-mark any you want back
+## Scam detection
+
+Every listing gets flagged automatically. The detection improves over time — it builds a local database of every listing and image hash it's ever seen.
+
+| Flag | What it means |
+|------|--------------|
+| `LOW $` | Price is less than half the median for that bedroom count (computed from all listings ever seen, not just the current batch) |
+| `NO IMG` | Zero photos |
+| `REPOST` | Same title already appeared under a different listing ID — across runs, not just within one search |
+| `STALE` | Posted more than 14 days ago |
+| `DUPE IMG` | First photo matches another listing's photo (perceptual hash, tolerates crops and slight edits) |
+
+Press `f` to hide all flagged listings at once.
+
+## Email drafting
+
+Every listing gets a short, personalized visit request drafted by Claude. No "Dear Sir/Madam", no regurgitating the listing description. It reads like a human wrote it because the prompt forces a specific structure.
+
+Press `e` and Gmail opens with subject, body, and (if `--fetch-emails` is on) the To: field pre-filled.
+
+## Map view
+
+Press `m` to open a browser map with all visible listings plotted. Green = clean, red = flagged. Click a marker for price, title, and a link to the listing. Respects current sort/filter.
+
+## All search options
+
+```
+--site              Craigslist site (default: sfbay)
+--area              Sub-area (default: sfc)
+-q / --query        Search text (e.g. "pet friendly")
+-n / --limit        Results per batch (default: 25)
+--min-price         Minimum rent
+--max-price         Maximum rent
+--min-bedrooms      Min BR count
+--max-bedrooms      Max BR count
+--min-sqft          Min square footage
+--max-sqft          Max square footage
+--max-age           Max posting age in days
+--has-images        Only listings with photos
+--exclude-drug-houses   Skip Tenderloin, Bayview, Mid-Market, Civic Center, etc.
+--delphi-pays-rent      Only the company rent subsidy zone ($750/mo off)
+--fetch-emails          Extract CL reply email via Chrome CDP (fills the To: field)
 ```
 
-### All search options
+## Managing state
 
-| Flag | Description |
+```bash
+# See everything you've contacted
+uv run python main.py contacted
+
+# Un-mark listings to bring them back
+```
+
+Disliked and contacted listings are stored in `.houseme_state.json`. Image hashes live in `.houseme_images.json`. Listing stats (prices, titles, neighborhoods) accumulate in `.houseme_listings.json` — this is what makes scam detection get smarter over time.
+
+## Architecture
+
+| File | What it does |
 |------|-------------|
-| `--site` | Craigslist site (default: `sfbay`) |
-| `--area` | Sub-area (default: `sfc`) |
-| `-q` / `--query` | Search query (e.g. `pet friendly`) |
-| `-n` / `--limit` | Max results per page (default: 25) |
-| `--min-price` / `--max-price` | Rent range |
-| `--min-bedrooms` / `--max-bedrooms` | Bedroom range |
-| `--min-sqft` / `--max-sqft` | Square footage range |
-| `--max-age` | Max posting age in days |
-| `--exclude-drug-houses` | Exclude Tenderloin, Bayview, Mid-Market, Civic Center |
-| `--delphi-pays-rent` | Only show listings in the Delphi rent subsidy zone ($750 off) |
-| `--fetch-emails` | Pre-fill the To: field by extracting CL reply emails via Chrome CDP |
-
-## How scam detection works
-
-Each listing gets checked for:
-
-- **LOW $** — rent is less than 50% of the median for that bedroom count
-- **NO IMG** — listing has zero photos
-- **REPOST** — same title posted multiple times with different IDs
-- **STALE** — posted more than 14 days ago
-- **DUPE IMG** — first photo matches another listing's photo (perceptual hash, persists across runs)
-
-## How email drafting works
-
-Every listing gets a personalized visit request email drafted by Claude Haiku. It uses your info from first-run setup and writes in a casual, direct tone — no fluff, no copy-pasting the listing description back at the landlord.
-
-Clicking `e` opens Gmail compose with subject + body pre-filled. With `--fetch-emails`, the To: field is also filled using the CL anonymous relay address (extracted via Chrome DevTools Protocol).
-
-## Files
-
-| File | Purpose |
-|------|---------|
-| `main.py` | CLI + TUI app, email drafting pipeline |
-| `craigslist.py` | CL search API client (via FlareSolverr) |
-| `filters.py` | Geo filtering, neighborhood exclusion, scam detection |
-| `imgdb.py` | Perceptual image hash database |
-| `approach_cdp.py`* | Chrome CDP email extraction (not committed) |
-
-\* Create your own `approach_cdp.py` if you want `--fetch-emails` support (`pip install playwright`). It needs to export `ensure_cdp()` and `get_reply_email(url)`.
+| `main.py` | CLI, TUI, email drafting, map generation |
+| `craigslist.py` | CL search API client via FlareSolverr |
+| `filters.py` | Scam detection, geo filtering, historical listings DB |
+| `imgdb.py` | Perceptual image hashing and duplicate detection |
+| `approach_cdp.py` | Chrome CDP for extracting CL reply emails (optional, needs `playwright`) |
