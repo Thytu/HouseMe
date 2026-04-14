@@ -4,6 +4,8 @@ I moved to SF and needed an apartment. Craigslist has the inventory but the expe
 
 So I built this. It pulls Craigslist listings into a terminal UI, flags the scams, drafts a personalized visit request email for every listing, and opens it in Gmail with one keystroke. It remembers what you've already seen so you never waste time on the same listing twice.
 
+![Listing table](screenshots/tui.png)
+
 ## What a session looks like
 
 ```bash
@@ -57,6 +59,10 @@ First run asks your name, job, and move-in date — saved locally, used to perso
 | `d` / `c` / `e` / `o` | Same as table |
 | `Escape` | Back |
 
+Select a listing and hit Enter to see its photos full-screen:
+
+![Detail view with inline image](screenshots/details.png)
+
 ## Scam detection
 
 Every listing gets flagged automatically. The detection improves over time — it builds a local database of every listing and image hash it's ever seen.
@@ -80,6 +86,16 @@ Press `e` and Gmail opens with subject, body, and (if `--fetch-emails` is on) th
 ## Map view
 
 Press `m` to open a browser map with all visible listings plotted. Green = clean, red = flagged. Click a marker for price, title, and a link to the listing. Respects current sort/filter.
+
+![Map view with subsidy zone](screenshots/map.png)
+
+## Subsidy zone
+
+If your company subsidizes rent in a specific area, use `--delphi-pays-rent` to filter listings to that zone. First time you use it, a browser-based editor opens where you draw the polygon yourself. Redraw anytime with:
+
+```bash
+uv run python main.py edit-zone
+```
 
 ## All search options
 
@@ -110,13 +126,13 @@ uv run python main.py contacted
 # Un-mark listings to bring them back
 ```
 
-Disliked and contacted listings are stored in `.houseme_state.json`. Image hashes live in `.houseme_images.json`. Listing stats (prices, titles, neighborhoods) accumulate in `.houseme_listings.json` — this is what makes scam detection get smarter over time.
+Disliked and contacted listings are stored in `.houseme_state.json`. Image hashes live in `.houseme_images.json`. Listing stats (prices, titles, neighborhoods) accumulate in `.houseme_listings.json` — this is what makes scam detection get smarter over time. The subsidy zone polygon lives in `.houseme_zone.json`.
 
 ## Architecture
 
 | File | What it does |
 |------|-------------|
-| `main.py` | CLI, TUI, email drafting, map generation |
+| `main.py` | CLI, TUI, email drafting, map generation, zone editor |
 | `craigslist.py` | CL search API client via FlareSolverr |
 | `filters.py` | Scam detection, geo filtering, historical listings DB |
 | `imgdb.py` | Perceptual image hashing and duplicate detection |
