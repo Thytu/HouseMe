@@ -16,8 +16,8 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.screen import Screen
-from textual.widget import Widget
 from textual.widgets import DataTable, Footer, Header, Static
+from textual_image.widget import Image as ImageWidget
 
 import craigslist
 import imgdb
@@ -25,39 +25,6 @@ from filters import COMPANY_ZONE, detect_scam_flags, is_excluded_area, point_in_
 
 CL_IMG_URL = "https://images.craigslist.org/{}_600x450.jpg"
 STATE_FILE = Path(__file__).parent / ".houseme_state.json"
-
-
-def image_to_rich(img: Image.Image, width: int, height: int) -> Text:
-    """Convert a PIL Image to a Rich Text renderable using half-block characters.
-
-    Each terminal row encodes two pixel rows via the upper-half-block character (▀)
-    with foreground = top pixel and background = bottom pixel, yielding 2x vertical
-    resolution within standard character cells.
-
-    Args:
-        img: Source PIL image (any mode — converted to RGB internally).
-        width: Target width in terminal columns.
-        height: Target height in terminal rows (each row = 2 pixel rows).
-    """
-    img = img.convert("RGB")
-    img = img.resize((width, height * 2), Image.LANCZOS)
-
-    lines: list[Text] = []
-    for y in range(0, img.height, 2):
-        line = Text()
-        for x in range(img.width):
-            tr, tg, tb = img.getpixel((x, y))
-            if y + 1 < img.height:
-                br, bg, bb = img.getpixel((x, y + 1))
-            else:
-                br, bg, bb = tr, tg, tb
-            line.append(
-                "▀",
-                style=f"rgb({tr},{tg},{tb}) on rgb({br},{bg},{bb})",
-            )
-        lines.append(line)
-
-    return Text("\n").join(lines)
 
 
 COMPANY_SUBSIDY = 750
@@ -309,44 +276,6 @@ def fetch_and_process(opts: SearchOpts, offset=0, seen_pids=None):
 # ---------------------------------------------------------------------------
 
 
-class ImageViewer(Widget):
-    """Widget that renders a PIL image as half-block characters, filling available space."""
-
-    DEFAULT_CSS = """
-    ImageViewer {
-        width: 1fr;
-        height: 1fr;
-        content-align: center middle;
-    }
-    """
-
-    def __init__(self, **kwargs: object) -> None:
-        super().__init__(**kwargs)
-        self._image: Image.Image | None = None
-        self._status: str = ""
-
-    def set_image(self, img: Image.Image) -> None:
-        self._image = img
-        self._status = ""
-        self.refresh(layout=True)
-
-    def set_status(self, msg: str) -> None:
-        self._image = None
-        self._status = msg
-        self.refresh(layout=True)
-
-    def render(self) -> Text:
-        if self._status:
-            return Text(self._status, justify="center")
-        if self._image is None:
-            return Text("")
-        w = self.size.width
-        h = self.size.height
-        if w < 4 or h < 2:
-            return Text("")
-        return image_to_rich(self._image, w, h)
-
-
 class ListingDetailScreen(Screen):
     """Full-screen detail view for a single listing with inline image preview."""
 
@@ -371,6 +300,18 @@ class ListingDetailScreen(Screen):
         padding: 0 1;
         background: $surface;
     }
+    #detail-image {
+        width: 1fr;
+        height: 1fr;
+    }
+    #detail-status {
+        width: 1fr;
+        height: 1fr;
+        content-align: center middle;
+    }
+    .hidden {
+        display: none;
+    }
     #detail-counter {
         height: 1;
         content-align: center middle;
@@ -388,7 +329,8 @@ class ListingDetailScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static(self._build_meta(), id="detail-meta")
-        yield ImageViewer(id="detail-image")
+        yield ImageWidget(id="detail-image", classes="hidden")
+        yield Static("", id="detail-status")
         yield Static("", id="detail-counter")
         yield Footer()
 
@@ -417,11 +359,11 @@ class ListingDetailScreen(Screen):
     def on_mount(self) -> None:
         self.title = "Listing Detail"
         if self._image_ids:
-            self._set_viewer_status("Loading...")
+            self._set_status("Loading...")
             self._update_counter()
             self._prefetch_all()
         else:
-            self.query_one("#detail-image", ImageViewer).set_status("No images available")
+            self._set_status("No images available")
             self._update_counter()
 
     def _update_counter(self) -> None:
@@ -432,13 +374,19 @@ class ListingDetailScreen(Screen):
         else:
             counter.update(f"Image {self._current_idx + 1} / {total}")
 
-    def _set_viewer_status(self, msg: str) -> None:
-        """Set status text on the image viewer (must be called on main thread)."""
-        self.query_one("#detail-image", ImageViewer).set_status(msg)
+    def _set_status(self, msg: str) -> None:
+        """Show status text and hide the image widget."""
+        self.query_one("#detail-image").add_class("hidden")
+        status = self.query_one("#detail-status", Static)
+        status.remove_class("hidden")
+        status.update(msg)
 
-    def _set_viewer_image(self, img: Image.Image) -> None:
-        """Set image on the image viewer (must be called on main thread)."""
-        self.query_one("#detail-image", ImageViewer).set_image(img)
+    def _set_image(self, img: Image.Image) -> None:
+        """Show an image and hide the status text."""
+        self.query_one("#detail-status").add_class("hidden")
+        image_widget = self.query_one("#detail-image", ImageWidget)
+        image_widget.remove_class("hidden")
+        image_widget.image = img
 
     @work(thread=True)
     def _prefetch_all(self) -> None:
@@ -462,29 +410,27 @@ class ListingDetailScreen(Screen):
                 img_id, img = future.result()
                 if img is not None:
                     self._image_cache[img_id] = img
-                    # If this is the image currently being viewed, display it
                     current_id = self._image_ids[self._current_idx]
                     if img_id == current_id:
                         self.app.call_from_thread(self._show_image, img, self._current_idx)
 
-        # If the current image failed to load, show error
         current_id = self._image_ids[self._current_idx]
         if current_id not in self._image_cache:
-            self.app.call_from_thread(self._set_viewer_status, "Failed to load image")
+            self.app.call_from_thread(self._set_status, "Failed to load image")
 
     def _show_current_image(self) -> None:
         """Show the current image from cache, or Loading... if not yet available."""
         img_id = self._image_ids[self._current_idx]
         if img_id in self._image_cache:
-            self._set_viewer_image(self._image_cache[img_id])
+            self._set_image(self._image_cache[img_id])
         else:
-            self._set_viewer_status("Loading...")
+            self._set_status("Loading...")
         self._update_counter()
 
     def _show_image(self, img: Image.Image, idx: int) -> None:
         """Display a loaded image if it's still the current index."""
         if idx == self._current_idx:
-            self._set_viewer_image(img)
+            self._set_image(img)
             self._update_counter()
 
     def action_next_image(self) -> None:

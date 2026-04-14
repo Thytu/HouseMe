@@ -12,6 +12,7 @@ dependencies = [
     "pillow>=12.2.0",
     "requests>=2.33.1",
     "textual>=8.2.3",
+    "textual-image[textual]>=0.12.0",
 ]
 
 [project.optional-dependencies]
