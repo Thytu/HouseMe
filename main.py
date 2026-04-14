@@ -1,3 +1,4 @@
+import io
 import json
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -8,16 +9,57 @@ from urllib.parse import quote
 
 import anthropic
 import click
+import requests
+from PIL import Image
+from rich.text import Text
+from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import DataTable, Footer, Header
-from textual import work
+from textual.screen import Screen
+from textual.widget import Widget
+from textual.widgets import DataTable, Footer, Header, Static
 
 import craigslist
 import imgdb
-from filters import detect_scam_flags, is_excluded_area, point_in_polygon, COMPANY_ZONE
+from filters import COMPANY_ZONE, detect_scam_flags, is_excluded_area, point_in_polygon
 
+CL_IMG_URL = "https://images.craigslist.org/{}_600x450.jpg"
 STATE_FILE = Path(__file__).parent / ".houseme_state.json"
+
+
+def image_to_rich(img: Image.Image, width: int, height: int) -> Text:
+    """Convert a PIL Image to a Rich Text renderable using half-block characters.
+
+    Each terminal row encodes two pixel rows via the upper-half-block character (▀)
+    with foreground = top pixel and background = bottom pixel, yielding 2x vertical
+    resolution within standard character cells.
+
+    Args:
+        img: Source PIL image (any mode — converted to RGB internally).
+        width: Target width in terminal columns.
+        height: Target height in terminal rows (each row = 2 pixel rows).
+    """
+    img = img.convert("RGB")
+    img = img.resize((width, height * 2), Image.LANCZOS)
+
+    lines: list[Text] = []
+    for y in range(0, img.height, 2):
+        line = Text()
+        for x in range(img.width):
+            tr, tg, tb = img.getpixel((x, y))
+            if y + 1 < img.height:
+                br, bg, bb = img.getpixel((x, y + 1))
+            else:
+                br, bg, bb = tr, tg, tb
+            line.append(
+                "▀",
+                style=f"rgb({tr},{tg},{tb}) on rgb({br},{bg},{bb})",
+            )
+        lines.append(line)
+
+    return Text("\n").join(lines)
+
+
 COMPANY_SUBSIDY = 750
 
 
@@ -265,6 +307,226 @@ def fetch_and_process(opts: SearchOpts, offset=0, seen_pids=None):
 # ---------------------------------------------------------------------------
 # Textual TUI
 # ---------------------------------------------------------------------------
+
+
+class ImageViewer(Widget):
+    """Widget that renders a PIL image as half-block characters, filling available space."""
+
+    DEFAULT_CSS = """
+    ImageViewer {
+        width: 1fr;
+        height: 1fr;
+        content-align: center middle;
+    }
+    """
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self._image: Image.Image | None = None
+        self._status: str = ""
+
+    def set_image(self, img: Image.Image) -> None:
+        self._image = img
+        self._status = ""
+        self.refresh(layout=True)
+
+    def set_status(self, msg: str) -> None:
+        self._image = None
+        self._status = msg
+        self.refresh(layout=True)
+
+    def render(self) -> Text:
+        if self._status:
+            return Text(self._status, justify="center")
+        if self._image is None:
+            return Text("")
+        w = self.size.width
+        h = self.size.height
+        if w < 4 or h < 2:
+            return Text("")
+        return image_to_rich(self._image, w, h)
+
+
+class ListingDetailScreen(Screen):
+    """Full-screen detail view for a single listing with inline image preview."""
+
+    BINDINGS = [
+        Binding("left", "prev_image", "Prev image"),
+        Binding("right", "next_image", "Next image"),
+        Binding("d", "dislike", "Dislike"),
+        Binding("c", "contacted", "Contacted"),
+        Binding("e", "open_draft", "Email draft"),
+        Binding("o", "open_listing", "Open listing"),
+        Binding("escape", "go_back", "Back"),
+        Binding("q", "go_back", "Back", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    ListingDetailScreen {
+        layout: vertical;
+    }
+    #detail-meta {
+        height: auto;
+        max-height: 5;
+        padding: 0 1;
+        background: $surface;
+    }
+    #detail-counter {
+        height: 1;
+        content-align: center middle;
+        color: $text-muted;
+    }
+    """
+
+    def __init__(self, post: dict, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self.post = post
+        self._image_ids: list[str] = post.get("image_ids", [])
+        self._image_cache: dict[str, Image.Image] = {}
+        self._current_idx: int = 0
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static(self._build_meta(), id="detail-meta")
+        yield ImageViewer(id="detail-image")
+        yield Static("", id="detail-counter")
+        yield Footer()
+
+    def _build_meta(self) -> Text:
+        p = self.post
+        price_raw = p.get("price")
+        price = p.get("price_str") or (f"${price_raw:,}" if price_raw else "N/A")
+        beds = f"{p['bedrooms']}BR" if p.get("bedrooms") is not None else ""
+        sqft = f"{p['sqft']:,} sqft" if p.get("sqft") else ""
+        loc = p.get("neighborhood") or p.get("location", "")
+        top_parts = [s for s in [price, beds, sqft, loc] if s]
+
+        title = p.get("title") or "untitled"
+        flags = " ".join(p.get("flags", [])) or "OK"
+        date = p["posted_date"].strftime("%b %d, %H:%M") if p.get("posted_date") else ""
+        img_count = f"{len(self._image_ids)} photo{'s' if len(self._image_ids) != 1 else ''}"
+
+        meta = Text()
+        meta.append(" \u00b7 ".join(top_parts), style="bold")
+        meta.append("\n")
+        meta.append(title)
+        meta.append("\n")
+        meta.append(f"Flags: {flags}  \u00b7  Posted: {date}  \u00b7  {img_count}")
+        return meta
+
+    def on_mount(self) -> None:
+        self.title = "Listing Detail"
+        if self._image_ids:
+            self._set_viewer_status("Loading...")
+            self._update_counter()
+            self._prefetch_all()
+        else:
+            self.query_one("#detail-image", ImageViewer).set_status("No images available")
+            self._update_counter()
+
+    def _update_counter(self) -> None:
+        total = len(self._image_ids)
+        counter = self.query_one("#detail-counter", Static)
+        if total == 0:
+            counter.update("")
+        else:
+            counter.update(f"Image {self._current_idx + 1} / {total}")
+
+    def _set_viewer_status(self, msg: str) -> None:
+        """Set status text on the image viewer (must be called on main thread)."""
+        self.query_one("#detail-image", ImageViewer).set_status(msg)
+
+    def _set_viewer_image(self, img: Image.Image) -> None:
+        """Set image on the image viewer (must be called on main thread)."""
+        self.query_one("#detail-image", ImageViewer).set_image(img)
+
+    @work(thread=True)
+    def _prefetch_all(self) -> None:
+        """Download all images concurrently. Show the first one as soon as it lands."""
+
+        def _download(img_id: str) -> tuple[str, Image.Image | None]:
+            try:
+                resp = requests.get(CL_IMG_URL.format(img_id), timeout=15)
+                resp.raise_for_status()
+                return img_id, Image.open(io.BytesIO(resp.content))
+            except Exception:
+                return img_id, None
+
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futures = {
+                pool.submit(_download, img_id): img_id
+                for img_id in self._image_ids
+                if img_id not in self._image_cache
+            }
+            for future in as_completed(futures):
+                img_id, img = future.result()
+                if img is not None:
+                    self._image_cache[img_id] = img
+                    # If this is the image currently being viewed, display it
+                    current_id = self._image_ids[self._current_idx]
+                    if img_id == current_id:
+                        self.app.call_from_thread(self._show_image, img, self._current_idx)
+
+        # If the current image failed to load, show error
+        current_id = self._image_ids[self._current_idx]
+        if current_id not in self._image_cache:
+            self.app.call_from_thread(self._set_viewer_status, "Failed to load image")
+
+    def _show_current_image(self) -> None:
+        """Show the current image from cache, or Loading... if not yet available."""
+        img_id = self._image_ids[self._current_idx]
+        if img_id in self._image_cache:
+            self._set_viewer_image(self._image_cache[img_id])
+        else:
+            self._set_viewer_status("Loading...")
+        self._update_counter()
+
+    def _show_image(self, img: Image.Image, idx: int) -> None:
+        """Display a loaded image if it's still the current index."""
+        if idx == self._current_idx:
+            self._set_viewer_image(img)
+            self._update_counter()
+
+    def action_next_image(self) -> None:
+        if not self._image_ids:
+            return
+        self._current_idx = (self._current_idx + 1) % len(self._image_ids)
+        self._show_current_image()
+
+    def action_prev_image(self) -> None:
+        if not self._image_ids:
+            return
+        self._current_idx = (self._current_idx - 1) % len(self._image_ids)
+        self._show_current_image()
+
+    def action_dislike(self) -> None:
+        app: HouseMeApp = self.app  # type: ignore[assignment]
+        app.dislike_post(self.post)
+        self.app.pop_screen()
+
+    def action_contacted(self) -> None:
+        app: HouseMeApp = self.app  # type: ignore[assignment]
+        app.contact_post(self.post)
+        self.app.pop_screen()
+
+    def action_open_draft(self) -> None:
+        gmail_url = self.post.get("_gmail_url")
+        if gmail_url:
+            webbrowser.open(gmail_url)
+            self.notify("Opening Gmail draft...")
+        else:
+            self.notify("No draft available", severity="error")
+
+    def action_open_listing(self) -> None:
+        url = self.post.get("url", "")
+        if url:
+            webbrowser.open(url)
+            self.notify("Opening listing...")
+
+    def action_go_back(self) -> None:
+        self.app.pop_screen()
+
+
 class HouseMeApp(App):
     CSS = """
     DataTable { height: 1fr; }
@@ -342,43 +604,59 @@ class HouseMeApp(App):
         pid = self._pid_by_row_key.get(row_key)
         return self._pid_to_post.get(pid)
 
-    def _remove_current_row(self):
-        table = self.query_one(DataTable)
-        if table.row_count == 0:
+    def _remove_post_row(self, pid: int) -> None:
+        """Remove a row from the table by PID."""
+        row_key = None
+        for rk, p in self._pid_by_row_key.items():
+            if p == pid:
+                row_key = rk
+                break
+        if row_key is None:
             return
-        row_key = list(table.rows.keys())[table.cursor_row]
-        pid = self._pid_by_row_key.pop(row_key, None)
-        if pid:
-            self._pid_to_post.pop(pid, None)
-            self.results = [r for r in self.results if r["pid"] != pid]
-            self._dismissed_pids.add(pid)
+        self._pid_by_row_key.pop(row_key, None)
+        self._pid_to_post.pop(pid, None)
+        self.results = [r for r in self.results if r["pid"] != pid]
+        self._dismissed_pids.add(pid)
+        table = self.query_one(DataTable)
         table.remove_row(row_key)
 
-    def action_dislike(self):
-        post = self._get_selected_post()
-        if not post:
-            return
+    def dislike_post(self, post: dict) -> None:
+        """Dislike a post: persist to state and remove from table."""
         pid = post["pid"]
         if pid not in self.state["disliked"]:
             self.state["disliked"].append(pid)
             _save_state(self.state)
-        self._remove_current_row()
+        self._remove_post_row(pid)
         self.notify("Disliked — hidden from future runs", severity="warning")
 
-    def action_contacted(self):
-        post = self._get_selected_post()
-        if not post:
-            return
+    def contact_post(self, post: dict) -> None:
+        """Mark a post as contacted: persist to state and remove from table."""
         pid = post["pid"]
         if pid not in self.state["contacted"]:
             self.state["contacted"].append(pid)
             meta = self.state.setdefault("contacted_meta", {})
             meta[str(pid)] = {"title": post.get("title", ""), "url": post.get("url", "")}
             _save_state(self.state)
-        self._remove_current_row()
+        self._remove_post_row(pid)
         self.notify("Marked as contacted", severity="information")
 
-    def action_open_draft(self):
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        pid = self._pid_by_row_key.get(event.row_key)
+        post = self._pid_to_post.get(pid) if pid is not None else None
+        if post:
+            self.push_screen(ListingDetailScreen(post))
+
+    def action_dislike(self) -> None:
+        post = self._get_selected_post()
+        if post:
+            self.dislike_post(post)
+
+    def action_contacted(self) -> None:
+        post = self._get_selected_post()
+        if post:
+            self.contact_post(post)
+
+    def action_open_draft(self) -> None:
         post = self._get_selected_post()
         if not post:
             return
@@ -389,7 +667,7 @@ class HouseMeApp(App):
         else:
             self.notify("No draft available", severity="error")
 
-    def action_open_listing(self):
+    def action_open_listing(self) -> None:
         post = self._get_selected_post()
         if not post:
             return
@@ -418,17 +696,17 @@ class HouseMeApp(App):
             self.results.extend(new_results)
             for p in new_results:
                 self._pid_to_post[p["pid"]] = p
-            self.call_from_thread(self._add_rows, new_results)
-            self.call_from_thread(
+            self.app.call_from_thread(self._add_rows, new_results)
+            self.app.call_from_thread(
                 self.notify, f"Loaded {len(new_results)} more listings"
             )
         else:
-            self.call_from_thread(
+            self.app.call_from_thread(
                 self.notify, "No more listings available", severity="warning"
             )
 
         self._loading = False
-        self.call_from_thread(self._update_title)
+        self.app.call_from_thread(self._update_title)
 
     def _update_title(self):
         self.title = f"HouseMe — {self.total:,} listings ({len(self.results)} loaded)"
