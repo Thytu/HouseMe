@@ -2,7 +2,6 @@ import html
 import http.server
 import io
 import json
-import re
 import socketserver
 import tempfile
 import threading
@@ -28,7 +27,7 @@ from textual_image.widget import Image as ImageWidget
 
 import craigslist
 import imgdb
-from filters import COMPANY_ZONE, detect_scam_flags, is_excluded_area, point_in_polygon
+from filters import detect_scam_flags, is_excluded_area, load_zone, point_in_polygon, save_zone
 
 CL_IMG_URL = "https://images.craigslist.org/{}_600x450.jpg"
 STATE_FILE = Path(__file__).parent / ".houseme_state.json"
@@ -48,6 +47,7 @@ class SearchOpts:
     limit: int = 25
     extra_params: dict = field(default_factory=dict)
     delphi_pays_rent: bool = False
+    zone: list[tuple[float, float]] = field(default_factory=list)
     exclude_drug_houses: bool = False
     max_age: int | None = None
     fetch_emails: bool = False
@@ -120,13 +120,13 @@ def _fetch_and_filter(opts: SearchOpts, offset: int, seen_pids: set, hidden_pids
             if len(raw) != before:
                 click.echo(f"    exclude_drug_houses: {before} → {len(raw)}", err=True)
 
-        if opts.delphi_pays_rent:
+        if opts.delphi_pays_rent and opts.zone:
             before = len(raw)
             no_coords = [r for r in raw if not (r.get("lat") and r.get("lon"))]
             raw = [
                 r for r in raw
                 if r.get("lat") and r.get("lon")
-                and point_in_polygon(r["lat"], r["lon"], COMPANY_ZONE)
+                and point_in_polygon(r["lat"], r["lon"], opts.zone)
             ]
             if len(raw) != before:
                 click.echo(f"    delphi_pays_rent: {before} → {len(raw)} ({len(no_coords)} had no coords)", err=True)
@@ -735,12 +735,14 @@ class HouseMeApp(App):
 
         zone_js = ""
         if self.delphi_pays_rent:
-            coords = ", ".join(f"[{lat}, {lon}]" for lat, lon in COMPANY_ZONE)
-            zone_js = (
-                f"L.polygon([{coords}], "
-                f"{{color: '#2196F3', weight: 2, fillOpacity: 0.08}})"
-                f".addTo(map).bindPopup('Delphi subsidy zone');\n"
-            )
+            zone = load_zone()
+            if zone:
+                coords = ", ".join(f"[{lat}, {lon}]" for lat, lon in zone)
+                zone_js = (
+                    f"L.polygon([{coords}], "
+                    f"{{color: '#2196F3', weight: 2, fillOpacity: 0.08, interactive: false}})"
+                    f".addTo(map);\n"
+                )
 
         avg_lat = sum(p["lat"] for p in posts) / len(posts)
         avg_lon = sum(p["lon"] for p in posts) / len(posts)
@@ -849,12 +851,25 @@ def search(site, area, query, limit, min_price, max_price, min_bedrooms, max_bed
         if val is not None:
             extra_params[key] = val
 
+    zone: list[tuple[float, float]] = []
+    if delphi_pays_rent:
+        zone = load_zone()
+        if not zone:
+            click.echo("\n  No subsidy zone defined yet. Opening the zone editor...")
+            click.echo("  Draw the zone in the browser, then click Save.\n")
+            _run_zone_editor([])
+            zone = load_zone()
+            if not zone:
+                click.echo("  No zone saved. Cannot use --delphi-pays-rent.")
+                return
+
     state = _load_state()
     applicant_info = _get_applicant_info(state)
 
     opts = SearchOpts(
         site=site, area=area, query=query, limit=limit,
         extra_params=extra_params, delphi_pays_rent=delphi_pays_rent,
+        zone=zone,
         exclude_drug_houses=exclude_drug_houses, max_age=max_age,
         fetch_emails=fetch_emails, has_images=has_images,
         applicant_info=applicant_info,
@@ -1060,36 +1075,18 @@ function save() {
 </body>
 </html>"""
 
-FILTERS_PY = Path(__file__).parent / "filters.py"
-
-
-def _write_zone_to_filters(coords: list[list[float]]) -> None:
-    """Replace COMPANY_ZONE in filters.py with new coordinates."""
-    source = FILTERS_PY.read_text()
-    lines = [f"    ({lat}, {lon})," for lat, lon in coords]
-    new_block = "COMPANY_ZONE = [\n" + "\n".join(lines) + "\n]"
-    updated = re.sub(
-        r"COMPANY_ZONE\s*=\s*\[.*?\]",
-        new_block,
-        source,
-        flags=re.DOTALL,
-    )
-    FILTERS_PY.write_text(updated)
-
-
-@cli.command("edit-zone")
-def edit_zone():
-    """Open a browser-based editor to draw the company subsidy zone polygon."""
-    existing = json.dumps([[lat, lon] for lat, lon in COMPANY_ZONE])
-    if COMPANY_ZONE:
-        center_lat = sum(p[0] for p in COMPANY_ZONE) / len(COMPANY_ZONE)
-        center_lon = sum(p[1] for p in COMPANY_ZONE) / len(COMPANY_ZONE)
+def _run_zone_editor(existing: list[tuple[float, float]]) -> None:
+    """Open the zone editor in a browser and block until the user saves."""
+    existing_json = json.dumps([[lat, lon] for lat, lon in existing])
+    if existing:
+        center_lat = sum(p[0] for p in existing) / len(existing)
+        center_lon = sum(p[1] for p in existing) / len(existing)
     else:
         center_lat, center_lon = 37.79, -122.42
 
     page = (
         ZONE_EDITOR_HTML
-        .replace("EXISTING_COORDS", existing)
+        .replace("EXISTING_COORDS", existing_json)
         .replace("CENTERLATLON", f"{center_lat}, {center_lon}")
     )
 
@@ -1122,14 +1119,20 @@ def edit_zone():
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
         webbrowser.open(f"http://localhost:{port}")
-        click.echo(f"  Zone editor open at http://localhost:{port}")
-        click.echo("  Draw the polygon in the browser, then click Save.")
-        click.echo("  Waiting...")
         saved_event.wait()
         httpd.shutdown()
 
-    _write_zone_to_filters(new_coords)
-    click.echo(f"  Saved {len(new_coords)} vertices to filters.py")
+    if new_coords:
+        save_zone(new_coords)
+        click.echo(f"  Saved {len(new_coords)} vertices.")
+
+
+@cli.command("edit-zone")
+def edit_zone():
+    """Open a browser-based editor to draw the company subsidy zone polygon."""
+    existing = load_zone()
+    click.echo("  Draw the zone in the browser, then click Save.")
+    _run_zone_editor(existing)
 
 
 if __name__ == "__main__":

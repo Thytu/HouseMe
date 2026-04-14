@@ -8,17 +8,24 @@ from pathlib import Path
 from statistics import median
 
 DB_FILE = Path(__file__).parent / ".houseme_listings.json"
+ZONE_FILE = Path(__file__).parent / ".houseme_zone.json"
 
-COMPANY_ZONE = [
-    (37.8049, -122.4471),
-    (37.792, -122.4445),
-    (37.7763, -122.4415),
-    (37.7788, -122.4216),
-    (37.7814, -122.4048),
-    (37.7846, -122.3878),
-    (37.8101, -122.3939),
-    (37.8134, -122.4226),
-]
+
+def load_zone() -> list[tuple[float, float]]:
+    """Load the subsidy zone polygon from disk.
+
+    Returns:
+        List of (lat, lon) tuples, or empty list if no zone is defined.
+    """
+    if ZONE_FILE.exists():
+        data = json.loads(ZONE_FILE.read_text())
+        return [tuple(p) for p in data]
+    return []
+
+
+def save_zone(coords: list[list[float]]) -> None:
+    """Save the subsidy zone polygon to disk."""
+    ZONE_FILE.write_text(json.dumps(coords, indent=2))
 
 EXCLUDE_HOODS_BY_NAME = {
     "tenderloin", "mid-market", "bayview", "civic center",

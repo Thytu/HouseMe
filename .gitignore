@@ -12,6 +12,8 @@ wheels/
 # HouseMe state (contains personal info)
 .houseme_state.json
 .houseme_images.json
+.houseme_listings.json
+.houseme_zone.json
 
 # Debug files
 debug_*.png
