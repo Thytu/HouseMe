@@ -27,21 +27,30 @@ def save_zone(coords: list[list[float]]) -> None:
     """Save the subsidy zone polygon to disk."""
     ZONE_FILE.write_text(json.dumps(coords, indent=2))
 
-EXCLUDE_HOODS_BY_NAME = {
-    "tenderloin", "mid-market", "bayview", "civic center",
-    "excelsior / outer mission", "visitacion valley",
-}
+EXCLUSIONS_FILE = Path(__file__).parent / ".houseme_exclusions.json"
 
-EXCLUDE_GEO_ZONES = [
-    (37.7805, 37.7870, -122.4190, -122.4070),
-    (37.7790, 37.7845, -122.4110, -122.4040),
-    (37.7785, 37.7815, -122.4200, -122.4130),
-    (37.7270, 37.7420, -122.3970, -122.3720),
-    (37.7760, 37.7810, -122.4200, -122.4100),
-]
+_exclusion_cache: dict[str, list[tuple[float, float]]] | None = None
 
 
-def point_in_polygon(lat, lon, polygon):
+def load_exclusion_zones() -> dict[str, list[tuple[float, float]]]:
+    """Load exclusion zone polygons from disk (cached after first read).
+
+    Returns:
+        Mapping of neighborhood name to list of (lat, lon) tuples.
+        Sourced from SF open data (real neighborhood boundaries).
+    """
+    global _exclusion_cache
+    if _exclusion_cache is not None:
+        return _exclusion_cache
+    if EXCLUSIONS_FILE.exists():
+        data = json.loads(EXCLUSIONS_FILE.read_text())
+        _exclusion_cache = {name: [tuple(p) for p in coords] for name, coords in data.items()}
+    else:
+        _exclusion_cache = {}
+    return _exclusion_cache
+
+
+def point_in_polygon(lat: float, lon: float, polygon: list[tuple[float, float]]) -> bool:
     """Ray-casting algorithm for point-in-polygon test."""
     n = len(polygon)
     inside = False
@@ -55,18 +64,14 @@ def point_in_polygon(lat, lon, polygon):
     return inside
 
 
-def is_excluded_area(post):
-    """Check if a listing is in a neighborhood we want to skip."""
-    hood = (post.get("neighborhood") or "").lower()
-    loc = (post.get("location") or "").lower()
-    for bad in EXCLUDE_HOODS_BY_NAME:
-        if bad in hood or bad in loc:
-            return True
+def is_excluded_area(post: dict) -> bool:
+    """Check if a listing falls inside any exclusion zone polygon."""
     lat, lon = post.get("lat"), post.get("lon")
-    if lat and lon:
-        for lat_min, lat_max, lon_min, lon_max in EXCLUDE_GEO_ZONES:
-            if lat_min <= lat <= lat_max and lon_min <= lon <= lon_max:
-                return True
+    if not lat or not lon:
+        return False
+    for zone_coords in load_exclusion_zones().values():
+        if point_in_polygon(lat, lon, zone_coords):
+            return True
     return False
 
 
@@ -159,22 +164,18 @@ def _build_repost_titles(db: dict[str, dict], current_pids: set[str]) -> set[str
     return {t for t, pids in title_pids.items() if len(pids) > 1}
 
 
-STOCK_IMG_THRESHOLD = 5
-
-
 def detect_scam_flags(results: list[dict]) -> None:
     """Add a 'flags' list to each result with scam indicators.
 
     Flags:
-        LOW $     — price below 50% of historical median for bedroom count
-        NO IMG    — zero images
-        REPOST    — normalized title seen on 2+ PIDs across all runs
-        STALE     — posted more than 14 days ago
-        DUPE IMG  — first image perceptual-hash matches another listing
-        STOCK IMG — first image seen on 5+ different listings (broker/stock photo)
+        LOW $    — price below 50% of historical median for bedroom count
+        NO IMG   — zero images
+        REPOST   — normalized title seen on 2+ PIDs across all runs
+        STALE    — posted more than 14 days ago
+        DUPE IMG — 50%+ of listing images match photos from other listings
 
     Must be called AFTER imgdb.check_and_store() so that _image_hash,
-    img_reuse_pids, and _image_reuse_count are populated on results.
+    img_reuse_pids, and _dupe_ratio are populated on results.
 
     Stats are computed from the full historical listings database,
     which grows more accurate with every run.
@@ -204,11 +205,8 @@ def detect_scam_flags(results: list[dict]) -> None:
         if posted and (now - posted).days > 14:
             flags.append("STALE")
 
-        # Image-based flags (populated by imgdb.check_and_store)
-        reuse_count = r.get("_image_reuse_count", 0)
-        if reuse_count >= STOCK_IMG_THRESHOLD:
-            flags.append("STOCK IMG")
-        elif r.get("img_reuse_pids"):
+        # Image-based flag (populated by imgdb.check_and_store)
+        if r.get("img_reuse_pids"):
             flags.append("DUPE IMG")
 
         r["flags"] = flags

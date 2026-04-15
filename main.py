@@ -27,7 +27,15 @@ from textual_image.widget import Image as ImageWidget
 
 import craigslist
 import imgdb
-from filters import detect_scam_flags, is_excluded_area, load_zone, point_in_polygon, save_zone
+from filters import (
+    EXCLUSIONS_FILE,
+    detect_scam_flags,
+    is_excluded_area,
+    load_exclusion_zones,
+    load_zone,
+    point_in_polygon,
+    save_zone,
+)
 
 CL_IMG_URL = "https://images.craigslist.org/{}_600x450.jpg"
 STATE_FILE = Path(__file__).parent / ".houseme_state.json"
@@ -52,6 +60,7 @@ class SearchOpts:
     max_age: int | None = None
     fetch_emails: bool = False
     has_images: bool = False
+    exclude_scams: bool = False
     applicant_info: str = ""
 
 
@@ -107,6 +116,12 @@ def _fetch_and_filter(opts: SearchOpts, offset: int, seen_pids: set, hidden_pids
 
         current_offset += len(raw)
         click.echo(f"  Fetched {len(raw)} from CL (total: {total})", err=True)
+
+        # Drop listings marked as rented
+        before = len(raw)
+        raw = [r for r in raw if not (r.get("title") or "").upper().startswith("RENTED")]
+        if len(raw) != before:
+            click.echo(f"    rented: {before} → {len(raw)}", err=True)
 
         if cutoff is not None:
             before = len(raw)
@@ -269,6 +284,12 @@ def fetch_and_process(opts: SearchOpts, offset=0, seen_pids=None):
         return [], total, next_offset
 
     _flag_scams_and_dupes(results)
+
+    if opts.exclude_scams:
+        before = len(results)
+        results = [r for r in results if not r.get("flags")]
+        if len(results) != before:
+            click.echo(f"    exclude_scams: {before} → {len(results)}", err=True)
 
     if opts.fetch_emails:
         _fetch_reply_emails(results)
@@ -738,14 +759,31 @@ class HouseMeApp(App):
             zone = load_zone()
             if zone:
                 coords = ", ".join(f"[{lat}, {lon}]" for lat, lon in zone)
-                zone_js = (
+                zone_js += (
                     f"L.polygon([{coords}], "
                     f"{{color: '#2196F3', weight: 2, fillOpacity: 0.08, interactive: false}})"
                     f".addTo(map);\n"
                 )
 
+        # Exclusion zones as red polygons
+        for name, zone_coords in load_exclusion_zones().items():
+            coords = ", ".join(f"[{lat}, {lon}]" for lat, lon in zone_coords)
+            zone_js += (
+                f"L.polygon([{coords}], "
+                f"{{color: '#f44336', weight: 2, fillOpacity: 0.15, interactive: false}})"
+                f".addTo(map);\n"
+            )
+
         avg_lat = sum(p["lat"] for p in posts) / len(posts)
         avg_lon = sum(p["lon"] for p in posts) / len(posts)
+
+        # Load crime heat map data if available
+        crime_file = Path(__file__).parent / ".houseme_crime_data.json"
+        crime_js = ""
+        if crime_file.exists():
+            crime_points = json.loads(crime_file.read_text())
+            crime_js = f"var crimeData = {json.dumps(crime_points)};\n"
+            crime_js += "var heat = L.heatLayer(crimeData, {radius: 18, blur: 25, maxZoom: 17, gradient: {0.2: '#ffffb2', 0.4: '#fd8d3c', 0.6: '#f03b20', 0.8: '#bd0026', 1.0: '#800026'}}).addTo(map);\n"
 
         map_html = f"""\
 <!DOCTYPE html>
@@ -756,6 +794,7 @@ class HouseMeApp(App):
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
 <style>html,body,#map{{height:100%;margin:0;}}</style>
 </head>
 <body>
@@ -767,7 +806,7 @@ L.tileLayer('https://{{s}}.basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}
   maxZoom: 20,
   subdomains: 'abcd'
 }}).addTo(map);
-{zone_js}{markers_js}
+{crime_js}{zone_js}{markers_js}
 </script>
 </body>
 </html>"""
@@ -840,8 +879,10 @@ def cli():
 @click.option("--max-age", default=None, type=int, help="Max posting age in days.")
 @click.option("--fetch-emails", is_flag=True, help="Fetch reply emails via CDP.")
 @click.option("--has-images", is_flag=True, help="Only show listings with photos.")
+@click.option("--exclude-scams", is_flag=True, help="Hide listings flagged as potential scams.")
 def search(site, area, query, limit, min_price, max_price, min_bedrooms, max_bedrooms,
-           min_sqft, max_sqft, delphi_pays_rent, exclude_drug_houses, max_age, fetch_emails, has_images):
+           min_sqft, max_sqft, delphi_pays_rent, exclude_drug_houses, max_age, fetch_emails, has_images,
+           exclude_scams):
     """Search Craigslist apartments for rent."""
 
     extra_params = {}
@@ -872,7 +913,7 @@ def search(site, area, query, limit, min_price, max_price, min_bedrooms, max_bed
         zone=zone,
         exclude_drug_houses=exclude_drug_houses, max_age=max_age,
         fetch_emails=fetch_emails, has_images=has_images,
-        applicant_info=applicant_info,
+        exclude_scams=exclude_scams, applicant_info=applicant_info,
     )
 
     results, total, _ = fetch_and_process(opts)
@@ -1133,6 +1174,264 @@ def edit_zone():
     existing = load_zone()
     click.echo("  Draw the zone in the browser, then click Save.")
     _run_zone_editor(existing)
+
+
+EXCLUSION_EDITOR_HTML = """\
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>HouseMe — Edit Exclusion Zones</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
+<style>
+html, body { height: 100%; margin: 0; font-family: system-ui, sans-serif; }
+#map { height: 100%; }
+#toolbar {
+  position: absolute; top: 10px; right: 10px; z-index: 1000;
+  background: white; padding: 12px; border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.25); max-width: 280px;
+}
+#toolbar button {
+  display: block; width: 100%; padding: 8px 12px; margin: 4px 0;
+  border: 1px solid #ccc; border-radius: 4px; cursor: pointer;
+  font-size: 14px; background: #f8f8f8;
+}
+#toolbar button:hover { background: #e8e8e8; }
+#toolbar button.primary { background: #2196F3; color: white; border-color: #1976D2; }
+#toolbar button.primary:hover { background: #1976D2; }
+#toolbar button.danger { background: #f44336; color: white; border-color: #d32f2f; }
+#toolbar button.danger:hover { background: #d32f2f; }
+#toolbar button.active { background: #4CAF50; color: white; border-color: #388E3C; }
+#status { font-size: 13px; color: #666; margin-top: 8px; }
+#zone-list { font-size: 12px; margin-top: 8px; max-height: 200px; overflow-y: auto; }
+.zone-item { padding: 4px 0; display: flex; justify-content: space-between; align-items: center; }
+.zone-item span { cursor: pointer; color: #f44336; font-weight: bold; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="toolbar">
+  <div style="font-weight:bold; margin-bottom:4px;">Exclusion Zone Editor</div>
+  <div style="font-size:12px; color:#666; margin-bottom:8px;">
+    Red heat map = 2025 homicides &amp; robberies (SFPD data).<br>
+    Draw polygons around areas to exclude.
+  </div>
+  <button id="btn-draw" onclick="toggleDraw()">Start new zone</button>
+  <button onclick="finishZone()">Finish current zone</button>
+  <button onclick="undo()">Undo last point</button>
+  <button onclick="save()" class="primary">Save all zones</button>
+  <div id="zone-list"></div>
+  <div id="status"></div>
+</div>
+<script>
+var map = L.map('map').setView([CENTERLATLON], 13);
+L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+  attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
+  maxZoom: 20, subdomains: 'abcd'
+}).addTo(map);
+
+// Crime heat map
+var crimeData = CRIME_DATA;
+L.heatLayer(crimeData, {
+  radius: 18, blur: 25, maxZoom: 17,
+  gradient: {0.2: '#ffffb2', 0.4: '#fd8d3c', 0.6: '#f03b20', 0.8: '#bd0026', 1.0: '#800026'}
+}).addTo(map);
+
+// Existing exclusion zones
+var existingZones = EXISTING_ZONES;
+var savedZones = {};
+var zoneId = 0;
+
+Object.entries(existingZones).forEach(function(entry) {
+  var name = entry[0], coords = entry[1];
+  addSavedZone(name, coords);
+});
+
+// Drawing state
+var drawing = false;
+var currentVertices = [];
+var currentMarkers = [];
+var currentPoly = null;
+
+function addSavedZone(name, coords) {
+  var id = zoneId++;
+  var poly = L.polygon(coords, {color: '#f44336', weight: 2, fillOpacity: 0.2, interactive: false}).addTo(map);
+  savedZones[id] = {name: name, coords: coords, layer: poly};
+  updateZoneList();
+}
+
+function removeZone(id) {
+  map.removeLayer(savedZones[id].layer);
+  delete savedZones[id];
+  updateZoneList();
+}
+
+function updateZoneList() {
+  var list = document.getElementById('zone-list');
+  var html = '';
+  Object.entries(savedZones).forEach(function(entry) {
+    var id = entry[0], z = entry[1];
+    html += '<div class="zone-item">' + z.name + ' (' + z.coords.length + 'v) <span onclick="removeZone(' + id + ')">X</span></div>';
+  });
+  list.innerHTML = html;
+  document.getElementById('status').textContent = Object.keys(savedZones).length + ' zone(s)';
+}
+
+function toggleDraw() {
+  drawing = !drawing;
+  document.getElementById('btn-draw').className = drawing ? 'active' : '';
+  document.getElementById('btn-draw').textContent = drawing ? 'Drawing... (click map)' : 'Start new zone';
+  if (!drawing && currentVertices.length >= 3) {
+    finishZone();
+  }
+}
+
+map.on('click', function(e) {
+  if (!drawing) return;
+  var latlng = [Math.round(e.latlng.lat * 10000) / 10000, Math.round(e.latlng.lng * 10000) / 10000];
+  currentVertices.push(latlng);
+  var marker = L.circleMarker(latlng, {
+    radius: 5, color: '#f44336', fillColor: '#fff', fillOpacity: 1, weight: 2
+  }).addTo(map);
+  currentMarkers.push(marker);
+  updateCurrentPoly();
+});
+
+function updateCurrentPoly() {
+  if (currentPoly) map.removeLayer(currentPoly);
+  if (currentVertices.length >= 3) {
+    currentPoly = L.polygon(currentVertices, {color: '#f44336', weight: 2, fillOpacity: 0.1, dashArray: '6 4'}).addTo(map);
+  } else if (currentVertices.length >= 2) {
+    currentPoly = L.polyline(currentVertices, {color: '#f44336', weight: 2, dashArray: '6 4'}).addTo(map);
+  }
+}
+
+function undo() {
+  if (currentVertices.length === 0) return;
+  currentVertices.pop();
+  var m = currentMarkers.pop();
+  if (m) map.removeLayer(m);
+  updateCurrentPoly();
+}
+
+function finishZone() {
+  if (currentVertices.length < 3) return;
+  var name = prompt('Zone name (e.g. "Tenderloin", "6th St corridor"):');
+  if (!name) name = 'Zone ' + (Object.keys(savedZones).length + 1);
+  addSavedZone(name, currentVertices.slice());
+  // Clear drawing state
+  currentMarkers.forEach(function(m) { map.removeLayer(m); });
+  if (currentPoly) map.removeLayer(currentPoly);
+  currentVertices = [];
+  currentMarkers = [];
+  currentPoly = null;
+  drawing = false;
+  document.getElementById('btn-draw').className = '';
+  document.getElementById('btn-draw').textContent = 'Start new zone';
+}
+
+function save() {
+  var zones = {};
+  Object.values(savedZones).forEach(function(z) { zones[z.name] = z.coords; });
+  fetch('/save', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(zones)
+  }).then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.ok) {
+        document.getElementById('status').innerHTML =
+          '<span style="color:green; font-weight:bold;">Saved! You can close this tab.</span>';
+      }
+    });
+}
+
+updateZoneList();
+</script>
+</body>
+</html>"""
+
+
+@cli.command("edit-exclusions")
+def edit_exclusions():
+    """Open a browser-based editor to draw exclusion zones over a crime heat map."""
+    crime_file = Path(__file__).parent / ".houseme_crime_data.json"
+    if not crime_file.exists():
+        click.echo("  No crime data found. Downloading from SFPD...")
+        import requests as req
+        resp = req.get(
+            "https://data.sfgov.org/resource/wg3w-h783.json",
+            params={
+                "$where": "incident_date>'2025-01-01' AND incident_category in('Homicide','Robbery')",
+                "$select": "latitude,longitude,incident_category",
+                "$limit": "5000",
+            },
+            timeout=30,
+        )
+        points = []
+        for r in resp.json():
+            lat, lon = r.get("latitude"), r.get("longitude")
+            if lat and lon:
+                intensity = 5.0 if r.get("incident_category") == "Homicide" else 1.0
+                points.append([float(lat), float(lon), intensity])
+        crime_file.write_text(json.dumps(points))
+        click.echo(f"  Downloaded {len(points)} incidents.")
+
+    crime_data = json.loads(crime_file.read_text())
+
+    existing = {}
+    if EXCLUSIONS_FILE.exists():
+        existing = json.loads(EXCLUSIONS_FILE.read_text())
+
+    page = (
+        EXCLUSION_EDITOR_HTML
+        .replace("CRIME_DATA", json.dumps(crime_data))
+        .replace("EXISTING_ZONES", json.dumps(existing))
+        .replace("CENTERLATLON", "37.77, -122.42")
+    )
+
+    saved_event = threading.Event()
+    new_zones: dict[str, list] = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(page.encode())
+
+        def do_POST(self) -> None:
+            length = int(self.headers["Content-Length"])
+            data = json.loads(self.rfile.read(length))
+            new_zones.update(data)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok": true}')
+            saved_event.set()
+
+        def log_message(self, fmt: str, *args: object) -> None:
+            pass
+
+    port = 8235
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.TCPServer(("127.0.0.1", port), Handler) as httpd:
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        webbrowser.open(f"http://localhost:{port}")
+        click.echo("  Draw exclusion zones over the crime heat map, then click Save.")
+        saved_event.wait()
+        httpd.shutdown()
+
+    if new_zones:
+        EXCLUSIONS_FILE.write_text(json.dumps(new_zones, indent=2))
+        # Clear cached zones
+        import filters
+        filters._exclusion_cache = None
+        click.echo(f"  Saved {len(new_zones)} exclusion zone(s).")
 
 
 if __name__ == "__main__":
