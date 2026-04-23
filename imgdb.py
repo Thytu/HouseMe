@@ -30,8 +30,12 @@ def _save_db(db: dict[str, list[dict]]) -> None:
 
 
 def _download_and_hash(image_id: str) -> str:
-    """Download a CL image and return its perceptual hash string."""
-    url = CL_IMG_URL.format(image_id)
+    """Download an image and return its perceptual hash string.
+
+    Args:
+        image_id: Either a bare CL image ID or a full URL (Zillow).
+    """
+    url = image_id if image_id.startswith("http") else CL_IMG_URL.format(image_id)
     resp = requests.get(url, timeout=10)
     resp.raise_for_status()
     img = Image.open(io.BytesIO(resp.content))
