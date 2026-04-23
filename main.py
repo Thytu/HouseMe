@@ -20,13 +20,14 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.screen import Screen
 from textual.containers import Container
+from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static
 from textual_image.widget import Image as ImageWidget
 
 import craigslist
 import imgdb
+import zillow
 from filters import (
     EXCLUSIONS_FILE,
     detect_scam_flags,
@@ -49,6 +50,7 @@ COMPANY_SUBSIDY = 750
 # ---------------------------------------------------------------------------
 @dataclass
 class SearchOpts:
+    source: str = "both"
     site: str = "sfbay"
     area: str = "sfc"
     query: str | None = None
@@ -97,71 +99,147 @@ def _get_applicant_info(state):
 # ---------------------------------------------------------------------------
 # Pipeline stages
 # ---------------------------------------------------------------------------
-def _fetch_and_filter(opts: SearchOpts, offset: int, seen_pids: set, hidden_pids: set):
-    """Fetch from CL API and apply all filters. Returns (filtered_results, total, next_offset)."""
-    collected = []
-    total = 0
-    current_offset = offset
+def _fetch_raw(opts: SearchOpts, current_offset: int, source: str) -> tuple[list[dict], int]:
+    """Fetch a batch of raw listings from a single source.
 
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=opts.max_age)) if opts.max_age is not None else None
+    Args:
+        opts: Search options.
+        current_offset: Pagination offset for this source.
+        source: One of "craigslist" or "zillow".
 
-    while len(collected) < opts.limit:
-        raw, total = craigslist.search(
-            site=opts.site, area=opts.area, category="apa",
-            query=opts.query, offset=current_offset, **opts.extra_params,
+    Returns:
+        (raw_listings, total_count) from the source.
+    """
+    if source == "zillow":
+        return zillow.search(
+            min_price=opts.extra_params.get("min_price"),
+            max_price=opts.extra_params.get("max_price"),
+            min_bedrooms=opts.extra_params.get("min_bedrooms"),
+            max_bedrooms=opts.extra_params.get("max_bedrooms"),
+            limit=opts.limit,
+            offset=current_offset,
         )
+    return craigslist.search(
+        site=opts.site, area=opts.area, category="apa",
+        query=opts.query, offset=current_offset, **opts.extra_params,
+    )
 
-        if not raw:
-            break
 
-        current_offset += len(raw)
-        click.echo(f"  Fetched {len(raw)} from CL (total: {total})", err=True)
+def _apply_filters(raw: list[dict], opts: SearchOpts, seen_pids: set, hidden_pids: set,
+                    cutoff: datetime | None, source: str) -> list[dict]:
+    """Apply all post-fetch filters to a batch of listings.
 
-        # Drop listings marked as rented
+    Args:
+        raw: Raw listings from a source.
+        opts: Search options.
+        seen_pids: PIDs already seen (for dedup).
+        hidden_pids: PIDs to hide (disliked/contacted).
+        cutoff: Oldest allowed posted_date, or None.
+        source: The source these listings came from.
+
+    Returns:
+        Filtered list of listings.
+    """
+    # Drop listings marked as rented (CL-specific title convention)
+    if source == "craigslist":
         before = len(raw)
         raw = [r for r in raw if not (r.get("title") or "").upper().startswith("RENTED")]
         if len(raw) != before:
             click.echo(f"    rented: {before} → {len(raw)}", err=True)
 
-        if cutoff is not None:
-            before = len(raw)
-            raw = [r for r in raw if r.get("posted_date") and r["posted_date"] >= cutoff]
-            if len(raw) != before:
-                click.echo(f"    max_age: {before} → {len(raw)}", err=True)
-
-        if opts.exclude_drug_houses:
-            before = len(raw)
-            raw = [r for r in raw if not is_excluded_area(r)]
-            if len(raw) != before:
-                click.echo(f"    exclude_drug_houses: {before} → {len(raw)}", err=True)
-
-        if opts.delphi_pays_rent and opts.zone:
-            before = len(raw)
-            no_coords = [r for r in raw if not (r.get("lat") and r.get("lon"))]
-            raw = [
-                r for r in raw
-                if r.get("lat") and r.get("lon")
-                and point_in_polygon(r["lat"], r["lon"], opts.zone)
-            ]
-            if len(raw) != before:
-                click.echo(f"    delphi_pays_rent: {before} → {len(raw)} ({len(no_coords)} had no coords)", err=True)
-
-        if opts.has_images:
-            before = len(raw)
-            raw = [r for r in raw if r.get("image_count")]
-            if len(raw) != before:
-                click.echo(f"    has_images: {before} → {len(raw)}", err=True)
-
+    if cutoff is not None:
         before = len(raw)
-        raw = [r for r in raw if r["pid"] not in hidden_pids and r["pid"] not in seen_pids]
+        raw = [r for r in raw if r.get("posted_date") and r["posted_date"] >= cutoff]
         if len(raw) != before:
-            click.echo(f"    hidden/seen: {before} → {len(raw)}", err=True)
-        collected.extend(raw)
+            click.echo(f"    max_age: {before} → {len(raw)}", err=True)
 
-        if current_offset >= total:
-            break
+    if opts.exclude_drug_houses:
+        before = len(raw)
+        raw = [r for r in raw if not is_excluded_area(r)]
+        if len(raw) != before:
+            click.echo(f"    exclude_drug_houses: {before} → {len(raw)}", err=True)
 
-    return collected[:opts.limit], total, current_offset
+    if opts.delphi_pays_rent and opts.zone:
+        before = len(raw)
+        no_coords = [r for r in raw if not (r.get("lat") and r.get("lon"))]
+        raw = [
+            r for r in raw
+            if r.get("lat") and r.get("lon")
+            and point_in_polygon(r["lat"], r["lon"], opts.zone)
+        ]
+        if len(raw) != before:
+            click.echo(f"    delphi_pays_rent: {before} → {len(raw)} ({len(no_coords)} had no coords)", err=True)
+
+    if opts.has_images:
+        before = len(raw)
+        raw = [r for r in raw if r.get("image_count")]
+        if len(raw) != before:
+            click.echo(f"    has_images: {before} → {len(raw)}", err=True)
+
+    before = len(raw)
+    raw = [r for r in raw if r["pid"] not in hidden_pids and r["pid"] not in seen_pids]
+    if len(raw) != before:
+        click.echo(f"    hidden/seen: {before} → {len(raw)}", err=True)
+
+    return raw
+
+
+def _fetch_and_filter(opts: SearchOpts, offset: int, seen_pids: set, hidden_pids: set):
+    """Fetch from CL and/or Zillow and apply all filters. Returns (filtered_results, total, next_offset)."""
+    sources = []
+    if opts.source in ("craigslist", "both"):
+        sources.append("craigslist")
+    if opts.source in ("zillow", "both"):
+        sources.append("zillow")
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=opts.max_age)) if opts.max_age is not None else None
+
+    # Per-source state
+    offsets = {s: offset for s in sources}
+    totals: dict[str, int] = {}
+    buckets: dict[str, list[dict]] = {s: [] for s in sources}
+    exhausted: set[str] = set()
+
+    # Fetch from all sources in rounds until we have enough combined results.
+    # Each round pulls one batch from each non-exhausted source.
+    while sum(len(b) for b in buckets.values()) < opts.limit and len(exhausted) < len(sources):
+        for source in sources:
+            if source in exhausted:
+                continue
+
+            raw, source_total = _fetch_raw(opts, offsets[source], source)
+            totals[source] = source_total
+
+            if not raw:
+                exhausted.add(source)
+                continue
+
+            offsets[source] += len(raw)
+            label = "Zillow" if source == "zillow" else "CL"
+            click.echo(f"  Fetched {len(raw)} from {label} (total: {source_total})", err=True)
+
+            filtered = _apply_filters(raw, opts, seen_pids, hidden_pids, cutoff, source)
+            buckets[source].extend(filtered)
+
+            if offsets[source] >= source_total:
+                exhausted.add(source)
+
+    # Interleave results so the TUI mixes sources rather than showing all-CL-then-all-Zillow
+    merged: list[dict] = []
+    iters = {s: iter(listings) for s, listings in buckets.items() if listings}
+    while iters:
+        done = []
+        for source, it in iters.items():
+            item = next(it, None)
+            if item is not None:
+                merged.append(item)
+            else:
+                done.append(source)
+        for s in done:
+            del iters[s]
+
+    combined_total = sum(totals.values())
+    return merged[:opts.limit], combined_total, max(offsets.values()) if offsets else offset
 
 
 def _flag_scams_and_dupes(results):
@@ -374,9 +452,10 @@ class ListingDetailScreen(Screen):
         price_raw = p.get("price")
         price = p.get("price_str") or (f"${price_raw:,}" if price_raw else "N/A")
         beds = f"{p['bedrooms']}BR" if p.get("bedrooms") is not None else ""
+        baths = f"{p['bathrooms']}BA" if p.get("bathrooms") is not None else ""
         sqft = f"{p['sqft']:,} sqft" if p.get("sqft") else ""
         loc = p.get("neighborhood") or p.get("location", "")
-        top_parts = [s for s in [price, beds, sqft, loc] if s]
+        top_parts = [s for s in [price, beds, baths, sqft, loc] if s]
 
         title = p.get("title") or "untitled"
         flags = " ".join(p.get("flags", [])) or "OK"
@@ -430,7 +509,9 @@ class ListingDetailScreen(Screen):
 
         def _download(img_id: str) -> tuple[str, Image.Image | None]:
             try:
-                resp = requests.get(CL_IMG_URL.format(img_id), timeout=15)
+                # Zillow image_ids are full URLs; CL ones are bare IDs
+                url = img_id if img_id.startswith("http") else CL_IMG_URL.format(img_id)
+                resp = requests.get(url, timeout=15)
                 resp.raise_for_status()
                 return img_id, Image.open(io.BytesIO(resp.content))
             except Exception:
@@ -558,13 +639,19 @@ class HouseMeApp(App):
         yield Footer()
 
     def on_mount(self):
-        self.title = f"HouseMe — {self.total:,} listings"
+        source_labels = {"craigslist": "CL", "zillow": "Zillow", "both": "CL + Zillow"}
+        self.title = f"HouseMe ({source_labels[self.opts.source]}) — {self.total:,} listings"
 
         table = self.query_one(DataTable)
         cols = ["Rent"]
         if self.delphi_pays_rent:
             cols.append("Subsidy")
-        cols += ["BR", "Sqft", "Title", "Location", "Posted", "Flags"]
+        cols += ["BR"]
+        if self.opts.source in ("zillow", "both"):
+            cols.append("BA")
+        cols += ["Sqft", "Title", "Location", "Posted", "Flags"]
+        if self.opts.source == "both":
+            cols.append("Src")
         table.add_columns(*cols)
 
         self._add_rows(self._visible_posts())
@@ -588,7 +675,14 @@ class HouseMeApp(App):
             if self.delphi_pays_rent:
                 after = f"${max(0, price_raw - COMPANY_SUBSIDY):,}" if price_raw else "—"
                 row.append(after)
-            row += [beds, sqft, title, loc, date, flags]
+            row += [beds]
+            if self.opts.source in ("zillow", "both"):
+                baths_val = post.get("bathrooms")
+                row.append(str(baths_val) if baths_val is not None else "—")
+            row += [sqft, title, loc, date, flags]
+            if self.opts.source == "both":
+                src = "Z" if post.get("source") == "zillow" else "CL"
+                row.append(src)
 
             row_key = table.add_row(*row)
             self._pid_by_row_key[row_key] = post["pid"]
@@ -851,7 +945,8 @@ L.tileLayer('https://{{s}}.basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}
         self.app.call_from_thread(self._update_title)
 
     def _update_title(self):
-        self.title = f"HouseMe — {self.total:,} listings ({len(self.results)} loaded)"
+        source_labels = {"craigslist": "CL", "zillow": "Zillow", "both": "CL + Zillow"}
+        self.title = f"HouseMe ({source_labels[self.opts.source]}) — {self.total:,} listings ({len(self.results)} loaded)"
 
 
 # ---------------------------------------------------------------------------
@@ -859,31 +954,32 @@ L.tileLayer('https://{{s}}.basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}
 # ---------------------------------------------------------------------------
 @click.group()
 def cli():
-    """HouseMe — Craigslist apartment hunter."""
+    """HouseMe — apartment hunter for Craigslist and Zillow."""
     pass
 
 
 @cli.command()
-@click.option("--site", default="sfbay", help="Craigslist site.")
-@click.option("--area", default="sfc", help="Sub-area.")
-@click.option("-q", "--query", default=None, help="Search query.")
+@click.option("--source", default="both", type=click.Choice(["both", "craigslist", "zillow"]), help="Listing source (default: both).")
+@click.option("--site", default="sfbay", help="Craigslist site (CL only).")
+@click.option("--area", default="sfc", help="Sub-area (CL only).")
+@click.option("-q", "--query", default=None, help="Search query (CL only).")
 @click.option("-n", "--limit", default=25, type=int, help="Max results per page.")
 @click.option("--min-price", default=None, type=int, help="Minimum rent.")
 @click.option("--max-price", default=None, type=int, help="Maximum rent.")
 @click.option("--min-bedrooms", default=None, type=int, help="Min bedrooms.")
 @click.option("--max-bedrooms", default=None, type=int, help="Max bedrooms.")
-@click.option("--min-sqft", default=None, type=int, help="Min sqft.")
-@click.option("--max-sqft", default=None, type=int, help="Max sqft.")
+@click.option("--min-sqft", default=None, type=int, help="Min sqft (CL only).")
+@click.option("--max-sqft", default=None, type=int, help="Max sqft (CL only).")
 @click.option("--delphi-pays-rent", is_flag=True, help="Only company subsidy zone ($750 off).")
 @click.option("--exclude-drug-houses", is_flag=True, help="Exclude bad neighborhoods.")
 @click.option("--max-age", default=None, type=int, help="Max posting age in days.")
-@click.option("--fetch-emails", is_flag=True, help="Fetch reply emails via CDP.")
+@click.option("--fetch-emails", is_flag=True, help="Fetch reply emails via CDP (CL only).")
 @click.option("--has-images", is_flag=True, help="Only show listings with photos.")
 @click.option("--exclude-scams", is_flag=True, help="Hide listings flagged as potential scams.")
-def search(site, area, query, limit, min_price, max_price, min_bedrooms, max_bedrooms,
+def search(source, site, area, query, limit, min_price, max_price, min_bedrooms, max_bedrooms,
            min_sqft, max_sqft, delphi_pays_rent, exclude_drug_houses, max_age, fetch_emails, has_images,
            exclude_scams):
-    """Search Craigslist apartments for rent."""
+    """Search apartments for rent on Craigslist or Zillow."""
 
     extra_params = {}
     for key, val in [("min_price", min_price), ("max_price", max_price),
@@ -908,6 +1004,7 @@ def search(site, area, query, limit, min_price, max_price, min_bedrooms, max_bed
     applicant_info = _get_applicant_info(state)
 
     opts = SearchOpts(
+        source=source,
         site=site, area=area, query=query, limit=limit,
         extra_params=extra_params, delphi_pays_rent=delphi_pays_rent,
         zone=zone,
