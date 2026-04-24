@@ -1,26 +1,30 @@
 # HouseMe
 
-I moved to SF and needed an apartment. Craigslist has the inventory but the experience is painful: walls of text, scam listings everywhere, and copy-pasting the same "Hi, I'm interested..." email 40 times.
+I moved to SF and needed an apartment. Craigslist and Zillow have the inventory but the experience is painful: walls of text, scam listings everywhere, and copy-pasting the same "Hi, I'm interested..." email 40 times.
 
-So I built this. It pulls Craigslist listings into a terminal UI, flags the scams, drafts a personalized visit request email for every listing, and opens it in Gmail with one keystroke. It remembers what you've already seen so you never waste time on the same listing twice.
+So I built this. It pulls listings from both Craigslist and Zillow into a terminal UI, flags the scams, drafts a personalized visit request email for every listing, and opens it in Gmail with one keystroke. It remembers what you've already seen so you never waste time on the same listing twice.
 
 ![Listing table](screenshots/tui.png)
 
 ## What a session looks like
 
 ```bash
-# Start FlareSolverr (one-time, runs in background)
+# Start FlareSolverr (one-time, runs in background — needed for Craigslist)
 docker run -d --name flaresolverr -p 8191:8191 ghcr.io/flaresolverr/flaresolverr
 
-# Search
+# Search both sources (default)
 uv run python main.py search \
   --min-price 2200 --max-price 3750 \
   --min-bedrooms 1 --max-age 7 \
   --exclude-drug-houses \
   --has-images
+
+# Or just one source
+uv run python main.py search --source zillow --min-price 2000 --max-price 3500
+uv run python main.py search --source craigslist --min-price 2200 --max-price 3750
 ```
 
-You get a navigable table. Arrow keys to browse, Enter to see photos, `e` to fire off an email, `d` to never see it again. Done in 10 minutes instead of an hour.
+You get a navigable table with results from both sources interleaved. Arrow keys to browse, Enter to see photos, `e` to fire off an email, `d` to never see it again. Done in 10 minutes instead of an hour.
 
 ## Setup
 
@@ -30,7 +34,7 @@ cd HouseMe
 uv sync
 ```
 
-Needs **Python 3.10+**, **FlareSolverr** on port 8191, and `ANTHROPIC_API_KEY` set for email drafting.
+Needs **Python 3.10+**, `ANTHROPIC_API_KEY` set for email drafting, and **FlareSolverr** on port 8191 for Craigslist (Zillow works without it).
 
 First run asks your name, job, and move-in date — saved locally, used to personalize emails.
 
@@ -100,21 +104,23 @@ uv run python main.py edit-zone
 ## All search options
 
 ```
---site              Craigslist site (default: sfbay)
---area              Sub-area (default: sfc)
--q / --query        Search text (e.g. "pet friendly")
+--source            Listing source: both (default), craigslist, or zillow
+--site              Craigslist site (default: sfbay, CL only)
+--area              Sub-area (default: sfc, CL only)
+-q / --query        Search text (CL only)
 -n / --limit        Results per batch (default: 25)
 --min-price         Minimum rent
 --max-price         Maximum rent
 --min-bedrooms      Min BR count
 --max-bedrooms      Max BR count
---min-sqft          Min square footage
---max-sqft          Max square footage
+--min-sqft          Min square footage (CL only)
+--max-sqft          Max square footage (CL only)
 --max-age           Max posting age in days
 --has-images        Only listings with photos
 --exclude-drug-houses   Skip Tenderloin, Bayview, Mid-Market, Civic Center, etc.
 --delphi-pays-rent      Only the company rent subsidy zone ($750/mo off)
---fetch-emails          Extract CL reply email via Chrome CDP (fills the To: field)
+--fetch-emails          Extract CL reply email via Chrome CDP (CL only)
+--exclude-scams         Hide listings flagged as potential scams
 ```
 
 ## Managing state
@@ -134,6 +140,11 @@ Disliked and contacted listings are stored in `.houseme_state.json`. Image hashe
 |------|-------------|
 | `main.py` | CLI, TUI, email drafting, map generation, zone editor |
 | `craigslist.py` | CL search API client via FlareSolverr |
+| `zillow.py` | Zillow search via `__NEXT_DATA__` extraction (no API key, no browser) |
 | `filters.py` | Scam detection, geo filtering, historical listings DB |
 | `imgdb.py` | Perceptual image hashing and duplicate detection |
 | `approach_cdp.py` | Chrome CDP for extracting CL reply emails (optional, needs `playwright`) |
+
+## How Zillow works
+
+Zillow pages embed all listing data in a `<script id="__NEXT_DATA__">` tag. Plain HTTP requests with a browser-like User-Agent fetch the page, and the JSON is extracted without any browser automation or proxies. PerimeterX blocks ~10% of requests; a simple retry loop handles it. Building listings with multiple unit types (studio, 1bd, 2bd) are expanded into separate rows so filters apply per-unit accurately.

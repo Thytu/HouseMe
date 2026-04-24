@@ -128,55 +128,35 @@ def _build_search_url(
     return f"{base}?searchQueryState={encoded}"
 
 
-def _parse_listing(raw: dict) -> dict:
-    """Convert a Zillow listResult into HouseMe's listing dict format.
+def _parse_unit_price(price_str: str) -> int | None:
+    """Parse a unit price string like "$3,596+" into an integer.
+
+    Args:
+        price_str: Zillow unit price string (e.g. "$3,596+", "$2,195/mo").
+
+    Returns:
+        Price as integer dollars, or None if unparseable.
+    """
+    cleaned = re.sub(r"[^0-9]", "", price_str)
+    return int(cleaned) if cleaned else None
+
+
+def _parse_listing(raw: dict) -> list[dict]:
+    """Convert a Zillow listResult into one or more HouseMe listing dicts.
+
+    Building listings with multiple unit types are expanded into one listing
+    per unit type so each row in the TUI represents a specific bed/price
+    combination. Individual listings produce a single-element list.
 
     Args:
         raw: A single entry from cat1.searchResults.listResults.
 
     Returns:
-        Normalized listing dict compatible with the HouseMe pipeline.
+        List of normalized listing dicts compatible with the HouseMe pipeline.
     """
     home_info = raw.get("hdpData", {}).get("homeInfo", {})
     lat_long = raw.get("latLong", {})
     is_building = raw.get("isBuilding", False)
-
-    # Price: prefer unformattedPrice (int), fall back to homeInfo.price
-    price = raw.get("unformattedPrice") or home_info.get("price")
-
-    # Bedrooms: individual listings have top-level "beds", buildings have "units"
-    bedrooms = raw.get("beds")
-    if bedrooms is None:
-        bedrooms = home_info.get("bedrooms")
-
-    # Bathrooms
-    baths = raw.get("baths") or home_info.get("bathrooms")
-
-    # Square footage
-    sqft = raw.get("area") or home_info.get("livingArea")
-
-    # For building listings, extract price/beds from the cheapest unit
-    units = raw.get("units", [])
-    if is_building and units:
-        if price is None:
-            price = raw.get("minBaseRent")
-            if price is None:
-                # Parse from unit price string like "$3,596+"
-                for unit in units:
-                    unit_price_str = unit.get("price", "")
-                    cleaned = re.sub(r"[^0-9]", "", unit_price_str)
-                    if cleaned:
-                        price = int(cleaned)
-                        break
-
-        if bedrooms is None and units:
-            # Use the first unit's bed count
-            first_beds = units[0].get("beds", "")
-            if first_beds != "":
-                try:
-                    bedrooms = int(first_beds)
-                except (ValueError, TypeError):
-                    pass
 
     # Posted date: derive from daysOnZillow
     days_on = home_info.get("daysOnZillow")
@@ -188,34 +168,20 @@ def _parse_listing(raw: dict) -> dict:
     photos_data = raw.get("carouselPhotosComposable", {})
     photo_entries = photos_data.get("photoData", [])
     photo_keys = [p["photoKey"] for p in photo_entries if p.get("photoKey")]
-
-    # Build image URLs (used as image_ids — the detail screen will detect full URLs)
     image_urls = [_ZILLOW_IMG_URL.format(key) for key in photo_keys]
 
-    # Title: use statusText (e.g. "Apartment for rent") + buildingName if available
+    # Title components
     building_name = raw.get("buildingName")
     address_street = raw.get("addressStreet", "")
-    status_text = raw.get("statusText", "")
-    if building_name:
-        title = f"{building_name} — {address_street}"
-    elif status_text and status_text != "FOR_RENT":
-        title = f"{status_text} — {address_street}"
-    else:
-        title = address_street
 
-    # Neighbourhood: use addressCity + zipcode as location
+    # Location
     location = ", ".join(
         s for s in [raw.get("addressCity"), raw.get("addressState")] if s
     )
     zipcode = raw.get("addressZipcode", "")
 
-    # zpid: Zillow's unique ID — use as pid (convert to int if possible)
+    # zpid: Zillow's unique ID
     zpid = raw.get("zpid", "")
-    try:
-        pid = int(zpid)
-    except (ValueError, TypeError):
-        # Building listings use "lat--lon" as zpid — hash it for a stable int
-        pid = hash(zpid) & 0x7FFFFFFFFFFFFFFF
 
     # Listing URL
     detail_url = raw.get("detailUrl", "")
@@ -230,39 +196,116 @@ def _parse_listing(raw: dict) -> dict:
             phone = cta.get("displayString")
             break
 
-    # Units info for building listings
-    units = raw.get("units", [])
-
-    # Rent zestimate
+    # Rent zestimate & facts
     rent_zestimate = home_info.get("rentZestimate")
-
-    # Facts and features
     facts = raw.get("factsAndFeatures", {})
 
-    return {
-        "pid": pid,
+    # Shared fields across all units of this listing
+    shared = {
         "zpid": zpid,
         "posted_date": posted_date,
-        "price": price,
-        "price_str": raw.get("price"),  # Formatted string like "$2,195/mo"
-        "title": title,
-        "bedrooms": bedrooms,
-        "bathrooms": baths,
-        "sqft": sqft,
         "lat": lat_long.get("latitude"),
         "lon": lat_long.get("longitude"),
         "location": location,
         "neighborhood": zipcode,
         "url": detail_url,
         "image_count": len(photo_keys),
-        "image_ids": image_urls,  # Full URLs (not CL-style bare IDs)
+        "image_ids": image_urls,
         "source": "zillow",
-        "is_building": raw.get("isBuilding", False),
-        "units": units,
+        "is_building": is_building,
         "phone": phone,
         "rent_zestimate": rent_zestimate,
         "home_type": home_info.get("homeType"),
         "facts": facts,
+    }
+
+    units = raw.get("units", [])
+
+    # Building with multiple unit types — expand into one listing per unit
+    if is_building and units:
+        results = []
+        for i, unit in enumerate(units):
+            if unit.get("roomForRent"):
+                continue
+
+            unit_beds_str = unit.get("beds", "")
+            unit_beds: int | None = None
+            if unit_beds_str != "":
+                try:
+                    unit_beds = int(unit_beds_str)
+                except (ValueError, TypeError):
+                    pass
+
+            unit_price = _parse_unit_price(unit.get("price", ""))
+
+            # Stable PID: hash zpid + unit index so each unit row is unique
+            pid = hash(f"{zpid}:unit:{i}") & 0x7FFFFFFFFFFFFFFF
+
+            beds_label = "Studio" if unit_beds == 0 else f"{unit_beds}bd"
+            if building_name:
+                title = f"{building_name} — {beds_label} — {address_street}"
+            else:
+                title = f"{address_street} — {beds_label}"
+
+            listing = {
+                **shared,
+                "pid": pid,
+                "price": unit_price,
+                "price_str": unit.get("price"),
+                "title": title,
+                "bedrooms": unit_beds,
+                "bathrooms": None,  # Not available per-unit from search
+                "sqft": None,  # Not available per-unit from search
+            }
+            results.append(listing)
+
+        return results if results else [_make_single_listing(raw, shared, home_info)]
+
+    # Individual listing — single result
+    return [_make_single_listing(raw, shared, home_info)]
+
+
+def _make_single_listing(raw: dict, shared: dict, home_info: dict) -> dict:
+    """Build a listing dict for an individual (non-building) listing.
+
+    Args:
+        raw: The raw Zillow listResult.
+        shared: Pre-computed shared fields.
+        home_info: The hdpData.homeInfo sub-dict.
+
+    Returns:
+        A single normalized listing dict.
+    """
+    zpid = shared["zpid"]
+    try:
+        pid = int(zpid)
+    except (ValueError, TypeError):
+        pid = hash(zpid) & 0x7FFFFFFFFFFFFFFF
+
+    price = raw.get("unformattedPrice") or home_info.get("price")
+    bedrooms = raw.get("beds")
+    if bedrooms is None:
+        bedrooms = home_info.get("bedrooms")
+
+    building_name = raw.get("buildingName")
+    address_street = raw.get("addressStreet", "")
+    status_text = raw.get("statusText", "")
+    if building_name:
+        title = f"{building_name} — {address_street}"
+    elif status_text and status_text != "FOR_RENT":
+        title = f"{status_text} — {address_street}"
+    else:
+        title = address_street
+
+    return {
+        **shared,
+        "pid": pid,
+        "price": price,
+        "price_str": raw.get("price"),
+        "title": title,
+        "bedrooms": bedrooms,
+        "bathrooms": raw.get("baths") or home_info.get("bathrooms"),
+        "sqft": raw.get("area") or home_info.get("livingArea"),
     }
 
 
@@ -321,7 +364,10 @@ def search(
         if not list_results:
             break
 
-        parsed = [_parse_listing(r) for r in list_results]
+        # _parse_listing returns a list (buildings expand into multiple entries)
+        parsed: list[dict] = []
+        for r in list_results:
+            parsed.extend(_parse_listing(r))
 
         # On the first page, skip listings to honor the offset
         if page == start_page and skip_on_first_page > 0:
