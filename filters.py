@@ -120,6 +120,7 @@ def _store_listings(db: dict[str, dict], results: list[dict]) -> None:
                 "image_count": r.get("image_count", 0),
                 "posted_date": posted.isoformat() if posted else None,
                 "image_hash": r.get("_image_hash"),
+                "zpid": r.get("zpid"),
             }
         elif r.get("_image_hash") and not db[pid_str].get("image_hash"):
             db[pid_str]["image_hash"] = r["_image_hash"]
@@ -153,15 +154,19 @@ def _build_repost_titles(db: dict[str, dict], current_pids: set[str]) -> set[str
     """Find normalized titles that appear across multiple PIDs in the DB.
 
     A title is a repost if it appears on 2+ different PIDs — whether from
-    this batch, previous runs, or both.
+    this batch, previous runs, or both. Zillow building units expanded from
+    the same listing (same zpid) are counted as one source, not separate
+    reposts.
     """
-    title_pids: dict[str, list[str]] = {}
+    title_sources: dict[str, set[str]] = {}
     for pid_str, entry in db.items():
         norm = entry.get("title_norm", "")
         if norm and len(norm) > 10:
-            title_pids.setdefault(norm, []).append(pid_str)
+            # Use zpid as the source key if available, otherwise pid
+            source_key = entry.get("zpid") or pid_str
+            title_sources.setdefault(norm, set()).add(source_key)
 
-    return {t for t, pids in title_pids.items() if len(pids) > 1}
+    return {t for t, sources in title_sources.items() if len(sources) > 1}
 
 
 def detect_scam_flags(results: list[dict]) -> None:

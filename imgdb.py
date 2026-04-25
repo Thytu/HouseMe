@@ -51,6 +51,10 @@ def check_and_store(results: list[dict]) -> int:
     (default 50%), so a single agency logo reused across listings
     won't trigger a false positive.
 
+    Zillow building units expanded from the same listing share identical
+    photos — these siblings are excluded from dupe detection via zpid
+    grouping.
+
     Returns the number of flagged listings.
     """
     db = _load_db()
@@ -62,15 +66,34 @@ def check_and_store(results: list[dict]) -> int:
         pids = {e["pid"] for e in entries}
         parsed_db.append((parsed_hash, pids))
 
-    # Build download tasks: (pid, image_id) for all images of all listings
+    # Build sibling groups: PIDs that share the same zpid (Zillow building units).
+    # These share identical photos by design and should not flag each other.
+    sibling_pids: dict[int, set[int]] = {}
+    zpid_groups: dict[str, set[int]] = {}
+    for r in results:
+        zpid = r.get("zpid")
+        if zpid and r.get("is_building"):
+            zpid_groups.setdefault(zpid, set()).add(r["pid"])
+    for pids_in_group in zpid_groups.values():
+        if len(pids_in_group) > 1:
+            for pid in pids_in_group:
+                sibling_pids[pid] = pids_in_group
+
+    # Deduplicate image downloads: siblings share identical image_ids,
+    # so we only download each unique image once.
+    seen_image_ids: set[str] = set()
     tasks: list[tuple[int, str]] = []
     for r in results:
         pid = r["pid"]
         for img_id in r.get("image_ids", []):
-            tasks.append((pid, img_id))
+            if img_id not in seen_image_ids:
+                tasks.append((pid, img_id))
+                seen_image_ids.add(img_id)
 
     # Download and hash all images concurrently
     hashes: dict[int, list[tuple[str, str]]] = {}
+    # Also cache hash results by image_id for siblings
+    hash_cache: dict[str, str] = {}
 
     def _fetch(task: tuple[int, str]) -> tuple[int, str, str]:
         pid, img_id = task
@@ -83,9 +106,21 @@ def check_and_store(results: list[dict]) -> int:
             try:
                 pid, hash_str, img_id = future.result()
                 hashes.setdefault(pid, []).append((hash_str, img_id))
+                hash_cache[img_id] = hash_str
             except Exception as e:
                 failed_pid = futures[future][0]
                 print(f"  Image hash failed for PID {failed_pid}: {e}")
+
+    # Copy cached hashes to siblings that didn't download themselves
+    for r in results:
+        pid = r["pid"]
+        if pid not in hashes:
+            pid_hashes = []
+            for img_id in r.get("image_ids", []):
+                if img_id in hash_cache:
+                    pid_hashes.append((hash_cache[img_id], img_id))
+            if pid_hashes:
+                hashes[pid] = pid_hashes
 
     # Check dupes and store — all per-listing work runs concurrently
     flagged = 0
@@ -93,12 +128,14 @@ def check_and_store(results: list[dict]) -> int:
 
     def _check_listing(pid: int, pid_hashes: list[tuple[str, str]]) -> tuple[int, int, float]:
         """Check one listing's images against the DB. Returns (pid, dupe_count, dupe_ratio)."""
+        # PIDs to ignore: self + sibling units from the same building
+        ignore_pids = sibling_pids.get(pid, {pid}) | {pid}
         dupe_count = 0
         for hash_str, _ in pid_hashes:
             current_hash = imagehash.hex_to_hash(hash_str)
             for stored_hash, stored_pids in parsed_db:
                 if current_hash - stored_hash <= HAMMING_THRESHOLD:
-                    if stored_pids - {pid}:
+                    if stored_pids - ignore_pids:
                         dupe_count += 1
                         break
         return pid, dupe_count, dupe_count / len(pid_hashes)
