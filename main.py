@@ -207,7 +207,15 @@ def _fetch_and_filter(opts: SearchOpts, offset: int, seen_pids: set, hidden_pids
             if source in exhausted:
                 continue
 
-            raw, source_total = _fetch_raw(opts, offsets[source], source)
+            label = "Zillow" if source == "zillow" else "CL"
+            try:
+                raw, source_total = _fetch_raw(opts, offsets[source], source)
+            except requests.ConnectionError:
+                hint = " Is FlareSolverr running?" if source == "craigslist" else ""
+                click.echo(f"  {label}: connection failed.{hint}", err=True)
+                exhausted.add(source)
+                continue
+
             totals[source] = source_total
 
             if not raw:
@@ -215,7 +223,6 @@ def _fetch_and_filter(opts: SearchOpts, offset: int, seen_pids: set, hidden_pids
                 continue
 
             offsets[source] += len(raw)
-            label = "Zillow" if source == "zillow" else "CL"
             click.echo(f"  Fetched {len(raw)} from {label} (total: {source_total})", err=True)
 
             filtered = _apply_filters(raw, opts, seen_pids, hidden_pids, cutoff, source)
