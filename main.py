@@ -149,7 +149,7 @@ def _apply_filters(raw: list[dict], opts: SearchOpts, seen_pids: set, hidden_pid
 
     if cutoff is not None:
         before = len(raw)
-        raw = [r for r in raw if r.get("posted_date") and r["posted_date"] >= cutoff]
+        raw = [r for r in raw if not r.get("posted_date") or r["posted_date"] >= cutoff]
         if len(raw) != before:
             click.echo(f"    max_age: {before} → {len(raw)}", err=True)
 
